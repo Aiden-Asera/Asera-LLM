@@ -1,5 +1,6 @@
 import * as cron from 'node-cron';
 import { notionService } from './notion';
+import { clientSyncService } from './clientSync';
 import { logger } from '../utils/logger';
 
 export interface SyncStats {
@@ -41,6 +42,9 @@ export class SyncScheduler {
     },
   ];
 
+  // Client database configuration
+  private readonly clientDatabaseId = '20f9a8eee622805ea2ecd18f3d424818';
+
   start(): void {
     logger.info('Starting enhanced sync scheduler with smart scheduling...');
 
@@ -50,6 +54,14 @@ export class SyncScheduler {
     }, {
       scheduled: false,
       timezone: 'America/New_York', // Adjust to your timezone
+    });
+
+    // Client sync (every 2 hours during business hours)
+    const clientSync = cron.schedule('0 */2 9-18 * * 1-5', async () => {
+      await this.performClientSync();
+    }, {
+      scheduled: false,
+      timezone: 'America/New_York',
     });
 
     // Evening sync (6 PM, Mon-Fri) - more thorough
@@ -78,20 +90,22 @@ export class SyncScheduler {
 
     // Start all tasks
     businessHoursSync.start();
+    clientSync.start();
     eveningSync.start();
     dailyFullSync.start();
     weeklyCleanup.start();
 
-    this.tasks.push(businessHoursSync, eveningSync, dailyFullSync, weeklyCleanup);
+    this.tasks.push(businessHoursSync, clientSync, eveningSync, dailyFullSync, weeklyCleanup);
     
-    logger.info('Enhanced sync scheduler started with multiple sync strategies:', {
-      businessHoursSync: 'Every 30min, Mon-Fri 9AM-6PM',
-      eveningSync: 'Daily 6PM Mon-Fri',
-      dailyFullSync: 'Daily 2AM',
-      weeklyCleanup: 'Sunday 3AM',
-      timezone: 'America/New_York',
-      databasesConfigured: this.notionDatabases.filter(db => db.id).length,
-    });
+          logger.info('Enhanced sync scheduler started with multiple sync strategies:', {
+        businessHoursSync: 'Every 30min, Mon-Fri 9AM-6PM',
+        clientSync: 'Every 2hrs, Mon-Fri 9AM-6PM',
+        eveningSync: 'Daily 6PM Mon-Fri',
+        dailyFullSync: 'Daily 2AM',
+        weeklyCleanup: 'Sunday 3AM',
+        timezone: 'America/New_York',
+        databasesConfigured: this.notionDatabases.filter(db => db.id).length,
+      });
 
     // Perform initial sync if no recent sync exists
     if (!this.stats.lastFullSync) {
@@ -242,6 +256,41 @@ export class SyncScheduler {
       this.stats.errors.push(`Full sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       
       logger.error('Full sync failed:', { 
+        error, 
+        duration: Date.now() - syncStartTime 
+      });
+    }
+  }
+
+  /**
+   * Perform client synchronization
+   */
+  private async performClientSync(): Promise<void> {
+    const syncStartTime = Date.now();
+    
+    try {
+      logger.info('Starting client sync...');
+      
+      // Sync updated clients (last 2 hours)
+      const sinceDate = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      const result = await clientSyncService.syncUpdatedClients(sinceDate);
+      
+      if (result.success) {
+        logger.info('Client sync completed successfully:', result.stats);
+      } else {
+        logger.error('Client sync failed:', result.stats);
+        this.stats.failedSyncs++;
+      }
+
+      const syncDuration = Date.now() - syncStartTime;
+      logger.info('Client sync completed', {
+        duration: syncDuration,
+        stats: result.stats,
+      });
+
+    } catch (error) {
+      this.stats.failedSyncs++;
+      logger.error('Client sync failed:', { 
         error, 
         duration: Date.now() - syncStartTime 
       });

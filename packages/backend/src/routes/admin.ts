@@ -5,6 +5,14 @@ import { ragService } from '../services/rag';
 import { ClientDatabase } from '../utils/database';
 import { logger } from '../utils/logger';
 import { analyticsService } from '../services/analytics';
+import { syncClientsFromNotion } from '../scripts/upload-clients';
+import { clientSyncService } from '../services/clientSync';
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+);
 
 const router = Router();
 
@@ -447,6 +455,111 @@ router.get('/system/status', (req: Request, res: Response) => {
     success: true,
     status
   });
+});
+
+// POST /api/admin/clients/upload-from-notion - Upload clients from Notion
+router.post('/clients/upload-from-notion', async (req: Request, res: Response) => {
+  try {
+    logger.info('Client upload from Notion requested via API');
+    
+    // Run the sync in background
+    syncClientsFromNotion().catch(error => {
+      logger.error('Background client upload failed:', { error });
+    });
+
+    res.json({
+      success: true,
+      message: 'Client upload from Notion triggered successfully',
+      note: 'Check logs for progress and results',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Failed to trigger client upload:', { error });
+    res.status(500).json({
+      error: 'Failed to trigger client upload',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// POST /api/admin/clients/sync - Sync clients (incremental or full)
+router.post('/clients/sync', async (req: Request, res: Response) => {
+  try {
+    const { type = 'incremental', hoursBack = 2 } = req.body;
+    
+    if (!['incremental', 'full'].includes(type)) {
+      return res.status(400).json({
+        error: 'Invalid sync type',
+        message: 'Type must be "incremental" or "full"',
+      });
+    }
+
+    logger.info('Client sync requested via API:', { type, hoursBack });
+    
+    let result;
+    if (type === 'full') {
+      result = await clientSyncService.syncAllClients();
+    } else {
+      const sinceDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
+      result = await clientSyncService.syncUpdatedClients(sinceDate);
+    }
+
+    res.json({
+      success: result.success,
+      message: `${type} client sync completed`,
+      stats: result.stats,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Failed to sync clients:', { error });
+    res.status(500).json({
+      error: 'Failed to sync clients',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// GET /api/admin/clients/status - Get client sync status
+router.get('/clients/status', async (req: Request, res: Response) => {
+  try {
+    // Get all clients from database
+    const { data: clients, error } = await supabase
+      .from('clients')
+      .select('id, name, slug, contact_email, updated_at, settings')
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    const clientStats = {
+      totalClients: clients?.length || 0,
+      clientsWithEmail: clients?.filter(c => c.contact_email).length || 0,
+      clientsWithPageInfo: clients?.filter(c => c.settings?.client_page_info).length || 0,
+      lastUpdated: clients?.[0]?.updated_at || null,
+      recentUpdates: clients?.slice(0, 5).map((c: any) => ({
+        name: c.name,
+        slug: c.slug,
+        lastUpdated: c.updated_at,
+        hasEmail: !!c.contact_email,
+      })) || [],
+    };
+
+    res.json({
+      success: true,
+      data: clientStats,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Failed to get client status:', { error });
+    res.status(500).json({
+      error: 'Failed to get client status',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
 });
 
 export default router; 

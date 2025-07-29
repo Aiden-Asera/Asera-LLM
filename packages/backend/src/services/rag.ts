@@ -303,11 +303,13 @@ export class RAGService {
         
         let promptContent;
         if (isGeneralConversation) {
-          // For casual conversation, just be Claude
-          promptContent = query;
+          // For casual conversation, just be Corra
+          promptContent = `You are Corra, a friendly and personable AI assistant. Respond warmly and naturally to this casual conversation: ${query}`;
         } else {
           // For potentially company-related questions, explain no context was found
-          promptContent = `${query}\n\n(Note: I don't have specific information about this topic in my current knowledge base. I can provide general assistance or suggest what kind of information might be helpful.)`;
+          promptContent = `You are Corra, a friendly and personable AI assistant. The user asked: "${query}"
+
+I don't have specific information about this topic in my current knowledge base, but I'd love to help! I can provide general assistance or suggest what kind of information might be helpful. Please respond in a warm, helpful way as Corra.`;
         }
 
         // Generate response without context
@@ -336,7 +338,15 @@ export class RAGService {
         })
         .join('\n\n');
 
-      const ragPrompt = `You are Claude, an AI assistant with access to Asera's company knowledge base. You can have normal conversations but also provide detailed information about Asera when relevant.
+      const ragPrompt = `You are Corra, a friendly and personable AI assistant with access to Asera's company knowledge base. You have a warm, conversational personality and love helping people with both casual chat and detailed information about Asera.
+
+Your personality traits:
+- Warm, friendly, and approachable - like talking to a knowledgeable friend
+- Enthusiastic about helping and sharing information
+- Uses natural, conversational language with occasional emojis when appropriate
+- Shows genuine interest in the user's questions
+- Maintains a helpful and supportive tone
+- Can be playful and engaging while staying professional
 
 Context from Asera's knowledge base:
 ${contextText}
@@ -344,11 +354,13 @@ ${contextText}
 User: ${query}
 
 Instructions:
-- For general conversation (greetings, casual chat), respond naturally like Claude
-- For Asera-related questions, use the provided context to give detailed, accurate information
+- For general conversation (greetings, casual chat), respond naturally and warmly as Corra
+- For Asera-related questions, use the provided context to give detailed, accurate information in a friendly way
 - Reference sources when making claims about Asera (e.g., "According to the team meeting notes [1]...")
 - If the context doesn't fully answer an Asera question, share what you do know and suggest related information
-- Be helpful, friendly, and professional
+- Be helpful, friendly, and personable - like a knowledgeable colleague who's excited to help
+- Use natural language, avoid overly formal responses
+- Feel free to use occasional emojis to make responses more engaging and human
 
 Answer:`;
 

@@ -10,6 +10,7 @@ import { logger } from './utils/logger';
 // Import routes
 import chatRoutes from './routes/chat';
 import adminRoutes from './routes/admin';
+import webhookRoutes from './routes/webhooks';
 
 // Import services
 import { syncScheduler } from './services/syncScheduler';
@@ -42,6 +43,7 @@ app.get('/health', (req, res) => {
 // Routes
 app.use('/api/chat', chatRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/webhooks', webhookRoutes);
 
 // Basic test route
 app.get('/api/test', (req, res) => {

@@ -96,7 +96,7 @@ function App() {
           margin: '0.25rem 0 0 0',
           fontSize: '0.9rem'
         }}>
-          Powered by Claude AI
+          Powered by Corra AI
         </p>
       </div>
 
@@ -113,9 +113,9 @@ function App() {
             color: '#6b7280',
             marginTop: '2rem'
           }}>
-            <p>👋 Welcome! Ask me anything to get started.</p>
+            <p>👋 Hi there! I'm Corra, your friendly AI assistant. Ask me anything to get started!</p>
             <p style={{ fontSize: '0.9rem', marginTop: '0.5rem' }}>
-              Try: "Hello!", "What can you help me with?", or "Tell me a joke"
+              Try: "Hello!", "What can you help me with?", or "Tell me a joke" 😊
             </p>
           </div>
         ) : (
@@ -135,7 +135,7 @@ function App() {
                 border: message.role === 'assistant' ? '1px solid #e5e7eb' : 'none'
               }}>
                 <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', opacity: 0.7 }}>
-                  {message.role === 'user' ? '👤 You' : '🤖 Assistant'}
+                  {message.role === 'user' ? '👤 You' : '🤖 Corra'}
                 </div>
                 <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
                 <div style={{ fontSize: '0.7rem', opacity: 0.5, marginTop: '0.25rem' }}>
@@ -160,7 +160,7 @@ function App() {
               boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)'
             }}>
               <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', opacity: 0.7 }}>
-                🤖 Assistant
+                🤖 Corra
               </div>
               <div style={{ color: '#6b7280' }}>
                 Thinking... 💭
