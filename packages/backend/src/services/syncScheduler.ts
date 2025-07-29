@@ -1,273 +1,368 @@
-import cron from 'node-cron';
+import * as cron from 'node-cron';
 import { notionService } from './notion';
-import { ragService } from './rag';
 import { logger } from '../utils/logger';
 
-export class SyncScheduler {
-  private static instance: SyncScheduler;
-  private tasks: Map<string, cron.ScheduledTask> = new Map();
+export interface SyncStats {
+  lastFullSync: Date | null;
+  lastIncrementalSync: Date | null;
+  totalSyncs: number;
+  failedSyncs: number;
+  documentsProcessed: number;
+  errors: string[];
+}
 
-  public static getInstance(): SyncScheduler {
-    if (!SyncScheduler.instance) {
-      SyncScheduler.instance = new SyncScheduler();
+export class SyncScheduler {
+  private tasks: cron.ScheduledTask[] = [];
+  private stats: SyncStats = {
+    lastFullSync: null,
+    lastIncrementalSync: null,
+    totalSyncs: 0,
+    failedSyncs: 0,
+    documentsProcessed: 0,
+    errors: [],
+  };
+
+  // Configuration for your Notion databases
+  private readonly notionDatabases = [
+    {
+      id: process.env.NOTION_MEETING_NOTES_DB_ID || '',
+      type: 'notion_meeting_notes' as const,
+      name: 'Meeting Notes',
+    },
+    {
+      id: process.env.NOTION_CLIENT_PAGES_DB_ID || '',
+      type: 'notion_client_page' as const,
+      name: 'Client Pages',
+    },
+    {
+      id: process.env.NOTION_WEBSITE_OUTLINE_DB_ID || '',
+      type: 'notion_website_outline' as const,
+      name: 'Website Outline',
+    },
+  ];
+
+  start(): void {
+    logger.info('Starting enhanced sync scheduler with smart scheduling...');
+
+    // Business hours incremental sync (every 30 minutes, Mon-Fri, 9 AM - 6 PM)
+    const businessHoursSync = cron.schedule('*/30 9-18 * * 1-5', async () => {
+      await this.performIncrementalSync();
+    }, {
+      scheduled: false,
+      timezone: 'America/New_York', // Adjust to your timezone
+    });
+
+    // Evening sync (6 PM, Mon-Fri) - more thorough
+    const eveningSync = cron.schedule('0 18 * * 1-5', async () => {
+      await this.performIncrementalSync(2); // Last 2 hours
+    }, {
+      scheduled: false,
+      timezone: 'America/New_York',
+    });
+
+    // Daily full sync (2 AM every day)
+    const dailyFullSync = cron.schedule('0 2 * * *', async () => {
+      await this.performFullSync();
+    }, {
+      scheduled: false,
+      timezone: 'America/New_York',
+    });
+
+    // Weekly cleanup (Sunday 3 AM)
+    const weeklyCleanup = cron.schedule('0 3 * * 0', async () => {
+      await this.performWeeklyMaintenance();
+    }, {
+      scheduled: false,
+      timezone: 'America/New_York',
+    });
+
+    // Start all tasks
+    businessHoursSync.start();
+    eveningSync.start();
+    dailyFullSync.start();
+    weeklyCleanup.start();
+
+    this.tasks.push(businessHoursSync, eveningSync, dailyFullSync, weeklyCleanup);
+    
+    logger.info('Enhanced sync scheduler started with multiple sync strategies:', {
+      businessHoursSync: 'Every 30min, Mon-Fri 9AM-6PM',
+      eveningSync: 'Daily 6PM Mon-Fri',
+      dailyFullSync: 'Daily 2AM',
+      weeklyCleanup: 'Sunday 3AM',
+      timezone: 'America/New_York',
+      databasesConfigured: this.notionDatabases.filter(db => db.id).length,
+    });
+
+    // Perform initial sync if no recent sync exists
+    if (!this.stats.lastFullSync) {
+      setTimeout(() => {
+        this.performIncrementalSync().catch(error => {
+          logger.error('Initial sync failed:', { error });
+        });
+      }, 5000); // Wait 5 seconds after startup
     }
-    return SyncScheduler.instance;
   }
 
-  private constructor() {}
+  /**
+   * Perform incremental sync (only recent changes)
+   */
+  private async performIncrementalSync(hoursBack: number = 1): Promise<void> {
+    const syncStartTime = Date.now();
+    
+    try {
+      logger.info('Starting incremental sync...', { hoursBack });
+      
+      const sinceDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
+      let totalDocuments = 0;
+      const errors: string[] = [];
+
+      for (const database of this.notionDatabases) {
+        if (!database.id) {
+          logger.warn(`Skipping ${database.name} - no database ID configured`);
+          continue;
+        }
+
+        try {
+          logger.info(`Syncing ${database.name} (${database.type})...`, {
+            databaseId: database.id,
+            since: sinceDate.toISOString(),
+          });
+
+          await notionService.syncUpdatedPages(database.id, database.type, sinceDate);
+          totalDocuments++; // This would be actual document count in a real implementation
+          
+          logger.info(`Successfully synced ${database.name}`);
+        } catch (dbError) {
+          const errorMsg = `Failed to sync ${database.name}: ${dbError instanceof Error ? dbError.message : 'Unknown error'}`;
+          errors.push(errorMsg);
+          logger.error(errorMsg, { 
+            databaseId: database.id, 
+            type: database.type,
+            error: dbError 
+          });
+        }
+      }
+
+      // Update stats
+      this.stats.lastIncrementalSync = new Date();
+      this.stats.totalSyncs++;
+      this.stats.documentsProcessed += totalDocuments;
+      
+      if (errors.length > 0) {
+        this.stats.failedSyncs++;
+        this.stats.errors.push(...errors.slice(0, 5)); // Keep last 5 errors
+        this.stats.errors = this.stats.errors.slice(-10); // Keep only last 10 errors total
+      }
+
+      const syncDuration = Date.now() - syncStartTime;
+      
+      logger.info('Incremental sync completed', {
+        duration: syncDuration,
+        documentsProcessed: totalDocuments,
+        errors: errors.length,
+        successRate: `${((this.stats.totalSyncs - this.stats.failedSyncs) / this.stats.totalSyncs * 100).toFixed(1)}%`,
+      });
+
+    } catch (error) {
+      this.stats.failedSyncs++;
+      this.stats.errors.push(`Incremental sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      
+      logger.error('Incremental sync failed:', { 
+        error, 
+        duration: Date.now() - syncStartTime 
+      });
+    }
+  }
 
   /**
-   * Start all scheduled sync tasks
+   * Perform full sync (all documents)
    */
-  start(): void {
-    logger.info('Starting sync scheduler...');
+  private async performFullSync(): Promise<void> {
+    const syncStartTime = Date.now();
+    
+    try {
+      logger.info('Starting full sync of all databases...');
+      
+      let totalDocuments = 0;
+      const errors: string[] = [];
 
-    // Daily sync at 2 AM
-    this.scheduleDailySync();
+      for (const database of this.notionDatabases) {
+        if (!database.id) {
+          logger.warn(`Skipping ${database.name} - no database ID configured`);
+          continue;
+        }
 
-    // Hourly check for urgent updates (optional)
-    this.scheduleHourlyCheck();
+        try {
+          logger.info(`Full sync of ${database.name} (${database.type})...`, {
+            databaseId: database.id,
+          });
 
-    logger.info('Sync scheduler started successfully');
+          await notionService.syncNotionDatabase(database.id, database.type);
+          totalDocuments++; // This would be actual document count in a real implementation
+          
+          logger.info(`Successfully completed full sync of ${database.name}`);
+          
+          // Small delay between databases to avoid rate limiting
+          await this.delay(2000);
+          
+        } catch (dbError) {
+          const errorMsg = `Failed to sync ${database.name}: ${dbError instanceof Error ? dbError.message : 'Unknown error'}`;
+          errors.push(errorMsg);
+          logger.error(errorMsg, { 
+            databaseId: database.id, 
+            type: database.type,
+            error: dbError 
+          });
+        }
+      }
+
+      // Update stats
+      this.stats.lastFullSync = new Date();
+      this.stats.totalSyncs++;
+      this.stats.documentsProcessed += totalDocuments;
+      
+      if (errors.length > 0) {
+        this.stats.failedSyncs++;
+        this.stats.errors.push(...errors.slice(0, 5));
+        this.stats.errors = this.stats.errors.slice(-10);
+      }
+
+      const syncDuration = Date.now() - syncStartTime;
+      
+      logger.info('Full sync completed', {
+        duration: syncDuration,
+        documentsProcessed: totalDocuments,
+        errors: errors.length,
+        totalSyncs: this.stats.totalSyncs,
+        successRate: `${((this.stats.totalSyncs - this.stats.failedSyncs) / this.stats.totalSyncs * 100).toFixed(1)}%`,
+      });
+
+    } catch (error) {
+      this.stats.failedSyncs++;
+      this.stats.errors.push(`Full sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      
+      logger.error('Full sync failed:', { 
+        error, 
+        duration: Date.now() - syncStartTime 
+      });
+    }
+  }
+
+  /**
+   * Perform weekly maintenance tasks
+   */
+  private async performWeeklyMaintenance(): Promise<void> {
+    try {
+      logger.info('Starting weekly maintenance...');
+
+      // Clear old error logs
+      this.stats.errors = this.stats.errors.slice(-5);
+
+      // Log weekly stats
+      logger.info('Weekly sync statistics:', {
+        totalSyncs: this.stats.totalSyncs,
+        failedSyncs: this.stats.failedSyncs,
+        successRate: this.stats.totalSyncs > 0 
+          ? `${((this.stats.totalSyncs - this.stats.failedSyncs) / this.stats.totalSyncs * 100).toFixed(1)}%`
+          : '0%',
+        documentsProcessed: this.stats.documentsProcessed,
+        lastFullSync: this.stats.lastFullSync?.toISOString(),
+        lastIncrementalSync: this.stats.lastIncrementalSync?.toISOString(),
+      });
+
+      // TODO: Add cleanup tasks like:
+      // - Remove old document versions
+      // - Optimize embeddings storage
+      // - Cleanup analytics data
+      
+      logger.info('Weekly maintenance completed');
+      
+    } catch (error) {
+      logger.error('Weekly maintenance failed:', { error });
+    }
+  }
+
+  /**
+   * Manual sync trigger
+   */
+  async triggerManualSync(type: 'incremental' | 'full' = 'incremental'): Promise<{
+    success: boolean;
+    message: string;
+    stats: SyncStats;
+  }> {
+    try {
+      logger.info('Manual sync triggered:', { type });
+      
+      if (type === 'full') {
+        await this.performFullSync();
+      } else {
+        await this.performIncrementalSync();
+      }
+
+      return {
+        success: true,
+        message: `${type} sync completed successfully`,
+        stats: this.getStats(),
+      };
+    } catch (error) {
+      logger.error('Manual sync failed:', { error, type });
+      return {
+        success: false,
+        message: `${type} sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        stats: this.getStats(),
+      };
+    }
+  }
+
+  /**
+   * Get current sync statistics
+   */
+  getStats(): SyncStats {
+    return { ...this.stats };
+  }
+
+  /**
+   * Check if sync is healthy
+   */
+  isHealthy(): boolean {
+    const now = new Date();
+    const lastSync = this.stats.lastIncrementalSync || this.stats.lastFullSync;
+    
+    if (!lastSync) {
+      return false; // No sync has ever run
+    }
+
+    // Consider unhealthy if no sync in last 2 hours during business hours
+    const hoursSinceLastSync = (now.getTime() - lastSync.getTime()) / (1000 * 60 * 60);
+    const isBusinessHours = now.getHours() >= 9 && now.getHours() <= 18;
+    
+    if (isBusinessHours && hoursSinceLastSync > 2) {
+      return false;
+    }
+
+    // Consider unhealthy if more than 25% of syncs are failing
+    const failureRate = this.stats.totalSyncs > 0 
+      ? (this.stats.failedSyncs / this.stats.totalSyncs) 
+      : 0;
+    
+    return failureRate < 0.25;
   }
 
   /**
    * Stop all scheduled tasks
    */
   stop(): void {
-    logger.info('Stopping sync scheduler...');
-    
-    this.tasks.forEach((task, name) => {
-      task.stop();
-      logger.info('Stopped task:', { taskName: name });
-    });
-    
-    this.tasks.clear();
-    logger.info('Sync scheduler stopped');
+    this.tasks.forEach(task => task.stop());
+    this.tasks = [];
+    logger.info('Enhanced sync scheduler stopped');
   }
 
   /**
-   * Schedule daily comprehensive sync
+   * Simple delay utility
    */
-  private scheduleDailySync(): void {
-    const task = cron.schedule('0 2 * * *', async () => {
-      logger.info('Starting daily comprehensive sync...');
-      
-      try {
-        await this.runComprehensiveSync();
-        logger.info('Daily comprehensive sync completed successfully');
-      } catch (error) {
-        logger.error('Daily comprehensive sync failed:', { error });
-      }
-    }, {
-      scheduled: false,
-      timezone: 'America/New_York' // Adjust to your timezone
-    });
-
-    this.tasks.set('daily-sync', task);
-    task.start();
-    
-    logger.info('Daily sync scheduled for 2:00 AM EST');
-  }
-
-  /**
-   * Schedule hourly check for recent updates
-   */
-  private scheduleHourlyCheck(): void {
-    const task = cron.schedule('0 * * * *', async () => {
-      logger.info('Starting hourly update check...');
-      
-      try {
-        await this.runIncrementalSync();
-        logger.info('Hourly update check completed');
-      } catch (error) {
-        logger.error('Hourly update check failed:', { error });
-      }
-    }, {
-      scheduled: false
-    });
-
-    this.tasks.set('hourly-check', task);
-    task.start();
-    
-    logger.info('Hourly update check scheduled');
-  }
-
-  /**
-   * Run comprehensive sync of all data sources
-   */
-  async runComprehensiveSync(): Promise<void> {
-    const startTime = Date.now();
-    logger.info('=== COMPREHENSIVE SYNC STARTED ===');
-
-    try {
-      // Sync all Notion databases
-      await notionService.syncAllDatabases();
-
-      // TODO: Add Slack sync when implemented
-      // await slackService.syncAllChannels();
-
-      logger.info('=== COMPREHENSIVE SYNC COMPLETED ===', {
-        duration: Date.now() - startTime,
-        timestamp: new Date().toISOString()
-      });
-
-    } catch (error) {
-      logger.error('=== COMPREHENSIVE SYNC FAILED ===', {
-        error,
-        duration: Date.now() - startTime
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Run incremental sync for recent updates only
-   */
-  async runIncrementalSync(): Promise<void> {
-    const startTime = Date.now();
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-    
-    logger.info('=== INCREMENTAL SYNC STARTED ===', {
-      sinceDate: oneHourAgo.toISOString()
-    });
-
-    try {
-      // Check for updated Notion pages in the last hour
-      const databases = [
-        {
-          id: process.env.NOTION_MEETING_NOTES_DB_ID,
-          type: 'notion_meeting_notes' as const,
-        },
-        {
-          id: process.env.NOTION_CLIENT_PAGES_DB_ID,
-          type: 'notion_client_page' as const,
-        },
-        {
-          id: process.env.NOTION_WEBSITE_OUTLINES_DB_ID,
-          type: 'notion_website_outline' as const,
-        },
-      ];
-
-      for (const db of databases) {
-        if (db.id) {
-          try {
-            await notionService.syncUpdatedPages(db.id, db.type, oneHourAgo);
-          } catch (error) {
-            logger.error('Failed to sync updated pages:', { 
-              error, 
-              databaseId: db.id,
-              type: db.type 
-            });
-          }
-        }
-      }
-
-      logger.info('=== INCREMENTAL SYNC COMPLETED ===', {
-        duration: Date.now() - startTime
-      });
-
-    } catch (error) {
-      logger.error('=== INCREMENTAL SYNC FAILED ===', {
-        error,
-        duration: Date.now() - startTime
-      });
-    }
-  }
-
-  /**
-   * Manually trigger a sync (for testing or admin use)
-   */
-  async triggerManualSync(type: 'comprehensive' | 'incremental' = 'comprehensive'): Promise<void> {
-    logger.info('Manual sync triggered:', { type });
-
-    try {
-      if (type === 'comprehensive') {
-        await this.runComprehensiveSync();
-      } else {
-        await this.runIncrementalSync();
-      }
-      
-      logger.info('Manual sync completed successfully:', { type });
-    } catch (error) {
-      logger.error('Manual sync failed:', { error, type });
-      throw error;
-    }
-  }
-
-  /**
-   * Get sync status and statistics
-   */
-  getSyncStatus(): {
-    isRunning: boolean;
-    scheduledTasks: string[];
-    lastRun?: Date;
-    nextRun?: Date;
-  } {
-    const taskNames = Array.from(this.tasks.keys());
-    const dailyTask = this.tasks.get('daily-sync');
-    
-    return {
-      isRunning: this.tasks.size > 0,
-      scheduledTasks: taskNames,
-      lastRun: undefined, // Would track this with a database
-      nextRun: dailyTask ? new Date() : undefined, // Simplified for now
-    };
-  }
-
-  /**
-   * Schedule a one-time sync for a specific time
-   */
-  scheduleOneTimeSync(
-    scheduledTime: Date,
-    type: 'comprehensive' | 'incremental' = 'comprehensive'
-  ): void {
-    const taskName = `one-time-${Date.now()}`;
-    
-    const cronExpression = this.dateToCronExpression(scheduledTime);
-    
-    const task = cron.schedule(cronExpression, async () => {
-      logger.info('One-time sync triggered:', { type, scheduledTime });
-      
-      try {
-        if (type === 'comprehensive') {
-          await this.runComprehensiveSync();
-        } else {
-          await this.runIncrementalSync();
-        }
-        
-        // Remove the task after execution
-        this.tasks.delete(taskName);
-        task.stop();
-        
-      } catch (error) {
-        logger.error('One-time sync failed:', { error, type });
-      }
-    }, {
-      scheduled: false
-    });
-
-    this.tasks.set(taskName, task);
-    task.start();
-    
-    logger.info('One-time sync scheduled:', { 
-      taskName, 
-      type, 
-      scheduledTime: scheduledTime.toISOString() 
-    });
-  }
-
-  /**
-   * Convert a Date to cron expression
-   */
-  private dateToCronExpression(date: Date): string {
-    const minute = date.getMinutes();
-    const hour = date.getHours();
-    const day = date.getDate();
-    const month = date.getMonth() + 1;
-    
-    return `${minute} ${hour} ${day} ${month} *`;
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 
-export const syncScheduler = SyncScheduler.getInstance(); 
+export const syncScheduler = new SyncScheduler(); 

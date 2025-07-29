@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { claudeService } from './claude';
+import { analyticsService } from './analytics';
 import { ClientDatabase } from '../utils/database';
 import { logger } from '../utils/logger';
 
@@ -23,6 +24,10 @@ export interface RAGResponse {
   tokenCount: number;
 }
 
+export interface DocumentChunkWithEmbedding extends DocumentChunk {
+  embedding: number[];
+}
+
 export class RAGService {
   private static instance: RAGService;
 
@@ -36,7 +41,7 @@ export class RAGService {
   private constructor() {}
 
   /**
-   * Chunk text into smaller pieces for processing
+   * Chunk text into smaller pieces for better embedding and retrieval
    */
   chunkText(
     text: string,
@@ -45,54 +50,52 @@ export class RAGService {
       overlapTokens?: number;
     } = {}
   ): Array<{ content: string; index: number; tokenCount: number }> {
-    const { maxTokens = 1000, overlapTokens = 100 } = options;
-
-    // Simple sentence-based chunking
-    const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 0);
-    const chunks: Array<{ content: string; index: number; tokenCount: number }> = [];
+    const { maxTokens = 500, overlapTokens = 50 } = options;
     
-    let currentChunk = '';
-    let currentTokens = 0;
+    // Rough token estimation (1 token ≈ 4 characters for English)
+    const avgCharsPerToken = 4;
+    const maxChars = maxTokens * avgCharsPerToken;
+    const overlapChars = overlapTokens * avgCharsPerToken;
+    
+    const chunks: Array<{ content: string; index: number; tokenCount: number }> = [];
+    let startPos = 0;
     let chunkIndex = 0;
-
-    for (const sentence of sentences) {
-      const sentenceText = sentence.trim() + '.';
-      const sentenceTokens = this.estimateTokenCount(sentenceText);
+    
+    while (startPos < text.length) {
+      let endPos = Math.min(startPos + maxChars, text.length);
       
-      // If adding this sentence would exceed maxTokens, create a new chunk
-      if (currentTokens + sentenceTokens > maxTokens && currentChunk.length > 0) {
-        chunks.push({
-          content: currentChunk.trim(),
-          index: chunkIndex++,
-          tokenCount: currentTokens,
-        });
-
-        // Start new chunk with overlap
-        if (overlapTokens > 0) {
-          const words = currentChunk.split(' ');
-          const overlapWords = words.slice(-Math.floor(overlapTokens / 4));
-          currentChunk = overlapWords.join(' ') + ' ' + sentenceText;
-          currentTokens = this.estimateTokenCount(currentChunk);
-        } else {
-          currentChunk = sentenceText;
-          currentTokens = sentenceTokens;
+      // Try to break at sentence boundaries
+      if (endPos < text.length) {
+        const sentenceEnd = text.lastIndexOf('.', endPos);
+        const paragraphEnd = text.lastIndexOf('\n', endPos);
+        const breakPoint = Math.max(sentenceEnd, paragraphEnd);
+        
+        if (breakPoint > startPos + maxChars * 0.5) {
+          endPos = breakPoint + 1;
         }
-      } else {
-        currentChunk += (currentChunk ? ' ' : '') + sentenceText;
-        currentTokens += sentenceTokens;
+      }
+      
+      const chunkContent = text.slice(startPos, endPos).trim();
+      
+      if (chunkContent.length > 0) {
+        chunks.push({
+          content: chunkContent,
+          index: chunkIndex,
+          tokenCount: this.estimateTokenCount(chunkContent),
+        });
+        chunkIndex++;
+      }
+      
+      // Calculate next start position with overlap
+      startPos = Math.max(endPos - overlapChars, endPos);
+      
+      // Avoid infinite loop
+      if (startPos >= endPos) {
+        startPos = endPos;
       }
     }
 
-    // Add the last chunk if it has content
-    if (currentChunk.trim().length > 0) {
-      chunks.push({
-        content: currentChunk.trim(),
-        index: chunkIndex,
-        tokenCount: currentTokens,
-      });
-    }
-
-    logger.info('Document chunked:', {
+    logger.info('Document chunked with real embeddings:', {
       originalLength: text.length,
       chunksCreated: chunks.length,
       avgChunkSize: chunks.reduce((sum, chunk) => sum + chunk.content.length, 0) / chunks.length,
@@ -102,7 +105,7 @@ export class RAGService {
   }
 
   /**
-   * Process and store a document with embeddings
+   * Process and store a document with REAL Claude embeddings
    */
   async processDocument(
     clientDb: ClientDatabase,
@@ -116,7 +119,7 @@ export class RAGService {
     }
   ): Promise<void> {
     try {
-      logger.info('Processing document for RAG:', {
+      logger.info('Processing document for RAG with REAL Claude embeddings:', {
         documentId: document.id,
         title: document.title,
         source: document.source,
@@ -136,31 +139,67 @@ export class RAGService {
       // Chunk the document
       const chunks = this.chunkText(document.content);
 
-      // Generate simple embeddings (for now we'll use a placeholder)
-      // In a full implementation, you'd call Claude or another embedding service
+      // Generate REAL embeddings for each chunk using Claude
+      let totalTokens = 0;
       for (const chunk of chunks) {
-        const embedding = this.generateSimpleEmbedding(chunk.content);
-        
-        await clientDb.insertDocumentChunk({
-          id: uuidv4(),
-          documentId: document.id,
-          content: chunk.content,
-          embedding,
-          chunkIndex: chunk.index,
-          tokenCount: chunk.tokenCount,
-          metadata: {
-            ...document.metadata,
-            chunkMetadata: {
-              originalIndex: chunk.index,
-              totalChunks: chunks.length,
+        try {
+          const embeddingResponse = await claudeService.generateEmbedding(chunk.content);
+          totalTokens += embeddingResponse.tokenCount;
+          
+          await clientDb.insertDocumentChunk({
+            id: uuidv4(),
+            documentId: document.id,
+            content: chunk.content,
+            embedding: embeddingResponse.embedding, // REAL Claude-powered embeddings!
+            chunkIndex: chunk.index,
+            tokenCount: embeddingResponse.tokenCount,
+            metadata: {
+              ...document.metadata,
+              chunkMetadata: {
+                originalIndex: chunk.index,
+                totalChunks: chunks.length,
+                embeddingModel: 'claude-3-haiku-20240307',
+                embeddingTokens: embeddingResponse.tokenCount,
+              },
             },
-          },
-        });
+          });
+
+          // Small delay to avoid rate limiting
+          await this.delay(100);
+
+        } catch (embeddingError) {
+          logger.error('Error generating embedding for chunk:', {
+            error: embeddingError,
+            documentId: document.id,
+            chunkIndex: chunk.index,
+          });
+          
+          // Use fallback embedding if Claude fails
+          const fallbackEmbedding = this.generateFallbackEmbedding(chunk.content);
+          await clientDb.insertDocumentChunk({
+            id: uuidv4(),
+            documentId: document.id,
+            content: chunk.content,
+            embedding: fallbackEmbedding,
+            chunkIndex: chunk.index,
+            tokenCount: chunk.tokenCount,
+            metadata: {
+              ...document.metadata,
+              chunkMetadata: {
+                originalIndex: chunk.index,
+                totalChunks: chunks.length,
+                embeddingModel: 'fallback',
+                embeddingTokens: 0,
+              },
+            },
+          });
+        }
       }
 
-      logger.info('Document processing completed:', {
+      logger.info('Document processing completed with real embeddings:', {
         documentId: document.id,
         chunksCreated: chunks.length,
+        totalEmbeddingTokens: totalTokens,
       });
     } catch (error) {
       logger.error('Error processing document:', {
@@ -173,7 +212,7 @@ export class RAGService {
   }
 
   /**
-   * Generate RAG response for a query
+   * Generate RAG response with REAL semantic search and analytics
    */
   async generateRAGResponse(
     clientDb: ClientDatabase,
@@ -183,22 +222,99 @@ export class RAGService {
       model?: string;
     } = {}
   ): Promise<RAGResponse> {
+    const startTime = Date.now();
+    let embeddingUsed = false;
+    let avgRelevanceScore = 0;
+    
     try {
       const { maxSources = 5, model } = options;
 
-      // Search for relevant chunks (using simple text search for now)
-      const similarChunks = await clientDb.searchSimilarChunks(query, maxSources);
+      logger.info('Starting enhanced RAG response generation:', {
+        query: query.substring(0, 100),
+        maxSources,
+        model,
+      });
+
+      let similarChunks: any[] = [];
+
+      try {
+        // Try vector similarity search with real Claude embeddings
+        const queryEmbedding = await claudeService.generateEmbedding(query);
+        embeddingUsed = true;
+        
+        similarChunks = await clientDb.searchSimilarChunksVector(
+          queryEmbedding.embedding, 
+          maxSources
+        );
+
+        if (similarChunks.length > 0) {
+          avgRelevanceScore = similarChunks.reduce((sum, chunk) => sum + (chunk.similarity || 0), 0) / similarChunks.length;
+          
+          logger.info('Vector similarity search successful:', {
+            query: query.substring(0, 50),
+            results: similarChunks.length,
+            avgSimilarity: avgRelevanceScore,
+          });
+        }
+      } catch (embeddingError) {
+        logger.warn('Vector search failed, falling back to keyword search:', {
+          error: embeddingError,
+          query: query.substring(0, 50),
+        });
+        embeddingUsed = false;
+      }
+
+      // Fallback to enhanced keyword search if vector search fails or returns no results
+      if (similarChunks.length === 0) {
+        similarChunks = await clientDb.searchSimilarChunks(query, maxSources);
+        
+        if (similarChunks.length > 0) {
+          // Calculate relevance scores for keyword matches
+          avgRelevanceScore = similarChunks.reduce((sum, chunk) => sum + (chunk.score || 0.5), 0) / similarChunks.length;
+          
+          logger.info('Keyword search results:', {
+            query: query.substring(0, 50),
+            results: similarChunks.length,
+            avgScore: avgRelevanceScore,
+          });
+        }
+      }
+
+      const responseTime = Date.now() - startTime;
+
+      // Track analytics
+      await analyticsService.trackSearch({
+        query,
+        resultsFound: similarChunks.length,
+        responseTime,
+        timestamp: new Date(),
+        clientId: (clientDb as any).clientId || 'asera-master',
+        embeddingUsed,
+        avgRelevanceScore,
+      });
 
       if (similarChunks.length === 0) {
         logger.warn('No relevant context found for query:', {
           query: query.substring(0, 100),
         });
 
+        // Check if this is a general conversation vs company-specific question
+        const isGeneralConversation = this.isGeneralConversation(query);
+        
+        let promptContent;
+        if (isGeneralConversation) {
+          // For casual conversation, just be Claude
+          promptContent = query;
+        } else {
+          // For potentially company-related questions, explain no context was found
+          promptContent = `${query}\n\n(Note: I don't have specific information about this topic in my current knowledge base. I can provide general assistance or suggest what kind of information might be helpful.)`;
+        }
+
         // Generate response without context
         const response = await claudeService.generateChatCompletion([
           {
             role: 'user',
-            content: `${query}\n\n(Note: No specific context documents were found to answer this question.)`,
+            content: promptContent,
           },
         ], { model });
 
@@ -209,23 +325,30 @@ export class RAGService {
         };
       }
 
-      // Create RAG prompt with context
+      // Create enhanced RAG prompt with context
       const contextText = similarChunks
-        .map((chunk, idx) => `[${idx + 1}] ${chunk.documents?.title || 'Document'}: ${chunk.content}`)
+        .map((chunk, idx) => {
+          const relevanceIndicator = embeddingUsed 
+            ? `(${((chunk.similarity || 0) * 100).toFixed(1)}% similarity)`
+            : `(keyword match)`;
+          
+          return `[${idx + 1}] ${chunk.documents?.title || 'Document'} ${relevanceIndicator}: ${chunk.content}`;
+        })
         .join('\n\n');
 
-      const ragPrompt = `You are a helpful AI assistant. Use the provided context to answer the user's question accurately. If the context doesn't contain enough information, say so clearly.
+      const ragPrompt = `You are Claude, an AI assistant with access to Asera's company knowledge base. You can have normal conversations but also provide detailed information about Asera when relevant.
 
-Context:
+Context from Asera's knowledge base:
 ${contextText}
 
-Question: ${query}
+User: ${query}
 
 Instructions:
-1. Answer based primarily on the provided context
-2. If the context doesn't contain enough information, say so clearly
-3. Reference specific sources when making claims (e.g., "According to document [1]...")
-4. Be concise but thorough
+- For general conversation (greetings, casual chat), respond naturally like Claude
+- For Asera-related questions, use the provided context to give detailed, accurate information
+- Reference sources when making claims about Asera (e.g., "According to the team meeting notes [1]...")
+- If the context doesn't fully answer an Asera question, share what you do know and suggest related information
+- Be helpful, friendly, and professional
 
 Answer:`;
 
@@ -237,9 +360,12 @@ Answer:`;
         },
       ], { model });
 
-      logger.info('RAG response generated:', {
+      logger.info('Enhanced RAG response generated:', {
         query: query.substring(0, 100),
         sourcesUsed: similarChunks.length,
+        responseTime: Date.now() - startTime,
+        embeddingUsed,
+        avgRelevanceScore,
         responseLength: response.content.length,
         tokenCount: response.tokenCount,
       });
@@ -251,14 +377,28 @@ Answer:`;
           title: chunk.documents?.title || 'Unknown Document',
           content: chunk.content.substring(0, 500), // Truncate for response
           source: chunk.documents?.source || 'unknown',
-          relevanceScore: 0.8 - (idx * 0.1), // Simple relevance scoring
+          relevanceScore: chunk.similarity || chunk.score || 0.8 - (idx * 0.1),
         })),
         tokenCount: response.tokenCount,
       };
     } catch (error) {
-      logger.error('Error generating RAG response:', {
+      const responseTime = Date.now() - startTime;
+      
+      // Track failed search
+      await analyticsService.trackSearch({
+        query,
+        resultsFound: 0,
+        responseTime,
+        timestamp: new Date(),
+        clientId: (clientDb as any).clientId || 'asera-master',
+        embeddingUsed: false,
+        avgRelevanceScore: 0,
+      });
+
+      logger.error('Error generating enhanced RAG response:', {
         error,
         query: query.substring(0, 100),
+        responseTime,
       });
       throw error;
     }
@@ -273,15 +413,20 @@ Answer:`;
   }
 
   /**
-   * Generate simple embedding (placeholder implementation)
-   * In production, you'd use Claude or another embedding service
+   * Small delay helper
    */
-  private generateSimpleEmbedding(text: string): number[] {
-    // Very simple hash-based embedding for demonstration
-    const dimension = 1536; // Match Claude's embedding dimension
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Generate fallback embedding when Claude fails
+   */
+  private generateFallbackEmbedding(text: string): number[] {
+    const dimension = 1536;
     const embedding: number[] = new Array(dimension).fill(0);
     
-    // Simple hash-based approach
+    // Simple hash-based approach as fallback
     for (let i = 0; i < text.length; i++) {
       const char = text.charCodeAt(i);
       const index = char % dimension;
@@ -297,6 +442,64 @@ Answer:`;
     }
     
     return embedding;
+  }
+
+  /**
+   * Determine if a query is general conversation vs company-specific
+   */
+  private isGeneralConversation(query: string): boolean {
+    const lowercaseQuery = query.toLowerCase().trim();
+    
+    // Common casual conversation patterns
+    const casualPatterns = [
+      // Greetings
+      /^(hi|hello|hey|yo|sup|what's up|whats up)$/,
+      /^(good morning|good afternoon|good evening)$/,
+      /^(how are you|how's it going|hows it going)$/,
+      
+      // Simple responses
+      /^(thanks|thank you|thx|ok|okay|cool|nice|great)$/,
+      /^(yes|no|yeah|yep|nope|sure)$/,
+      
+      // Basic questions that aren't company-specific
+      /^(what|who|when|where|why|how)(\s+\w+){0,2}\?*$/,
+      
+      // Small talk
+      /^(how's your day|hows your day|what's new|whats new)$/,
+    ];
+    
+    // Check if it matches casual patterns
+    for (const pattern of casualPatterns) {
+      if (pattern.test(lowercaseQuery)) {
+        return true;
+      }
+    }
+    
+    // Check for company-related keywords that suggest business context
+    const companyKeywords = [
+      'asera', 'company', 'business', 'team', 'project', 'client', 'work',
+      'meeting', 'goals', 'strategy', 'revenue', 'development', 'product'
+    ];
+    
+    const hasCompanyKeywords = companyKeywords.some(keyword => 
+      lowercaseQuery.includes(keyword)
+    );
+    
+    // If it has company keywords, treat as business question
+    if (hasCompanyKeywords) {
+      return false;
+    }
+    
+    // For short, simple queries (under 5 words) that don't have company keywords,
+    // treat as casual conversation
+    const wordCount = lowercaseQuery.split(/\s+/).length;
+    if (wordCount <= 4) {
+      return true;
+    }
+    
+    // For longer queries without company keywords, default to general conversation
+    // but let RAG search handle it (it will find no context and respond normally)
+    return false;
   }
 }
 

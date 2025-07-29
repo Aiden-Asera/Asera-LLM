@@ -155,27 +155,258 @@ export class ClientDatabase {
       return [];
     }
 
-    // Simple text search using ilike for now
-    const { data, error } = await supabase
-      .from('document_chunks')
-      .select(`
-        id,
-        content,
-        document_id,
-        chunk_index,
-        metadata,
-        documents!inner(title, source, client_id)
-      `)
-      .eq('documents.client_id', this.resolvedClientId)
-      .ilike('content', `%${query}%`)
-      .limit(limit);
+    try {
+      logger.info('Starting chunk search:', { query, limit, clientId: this.resolvedClientId });
 
-    if (error) {
-      logger.error('Error searching chunks:', { error, query });
+      // Extract meaningful keywords from the query
+      const keywords = this.extractKeywords(query);
+      logger.info('Extracted keywords:', { query, keywords });
+
+      if (keywords.length === 0) {
+        logger.warn('No keywords extracted from query:', { query });
+        return [];
+      }
+
+      // Try multiple search strategies
+      let allResults: any[] = [];
+
+      // Strategy 1: Search for each keyword individually
+      for (const keyword of keywords) {
+        const { data, error } = await supabase
+          .from('document_chunks')
+          .select(`
+            id,
+            content,
+            document_id,
+            chunk_index,
+            metadata,
+            documents!inner(title, source, client_id)
+          `)
+          .eq('documents.client_id', this.resolvedClientId)
+          .ilike('content', `%${keyword}%`)
+          .limit(limit * 2); // Get more results to ensure diversity
+
+        if (!error && data) {
+          allResults.push(...data);
+        }
+      }
+
+      // Strategy 2: Also search document titles
+      for (const keyword of keywords) {
+        const { data, error } = await supabase
+          .from('document_chunks')
+          .select(`
+            id,
+            content,
+            document_id,
+            chunk_index,
+            metadata,
+            documents!inner(title, source, client_id)
+          `)
+          .eq('documents.client_id', this.resolvedClientId)
+          .ilike('documents.title', `%${keyword}%`)
+          .limit(limit);
+
+        if (!error && data) {
+          allResults.push(...data);
+        }
+      }
+
+      // Remove duplicates and score results
+      const uniqueResults = this.deduplicateAndScore(allResults, keywords, limit);
+
+      logger.info('Chunk search completed:', {
+        query,
+        keywords,
+        totalResults: allResults.length,
+        uniqueResults: uniqueResults.length,
+        clientId: this.resolvedClientId
+      });
+
+      return uniqueResults;
+    } catch (error) {
+      logger.error('Error in chunk search:', { error, query });
+      return [];
+    }
+  }
+
+  /**
+   * Search using vector similarity with real embeddings
+   */
+  async searchSimilarChunksVector(
+    queryEmbedding: number[],
+    limit: number = 5
+  ): Promise<any[]> {
+    if (!supabase) {
+      logger.warn('Vector similarity search attempted but database not configured');
       return [];
     }
 
-    return data || [];
+    try {
+      logger.info('Starting vector similarity search:', { 
+        limit, 
+        clientId: this.resolvedClientId,
+        embeddingDimension: queryEmbedding.length 
+      });
+
+      // Get all document chunks for this client with their embeddings
+      const { data, error } = await supabase
+        .from('document_chunks')
+        .select(`
+          id,
+          content,
+          document_id,
+          chunk_index,
+          metadata,
+          embedding,
+          documents!inner(title, source, client_id)
+        `)
+        .eq('documents.client_id', this.resolvedClientId);
+
+      if (error) {
+        logger.error('Error fetching chunks for vector search:', { error });
+        return [];
+      }
+
+      if (!data || data.length === 0) {
+        logger.warn('No chunks found for vector similarity search');
+        return [];
+      }
+
+      // Calculate similarity scores for each chunk
+      const scoredChunks = data.map(chunk => {
+        let similarity = 0;
+        
+        try {
+          if (chunk.embedding && Array.isArray(chunk.embedding)) {
+            similarity = this.cosineSimilarity(queryEmbedding, chunk.embedding);
+          }
+        } catch (simError) {
+          logger.warn('Error calculating similarity for chunk:', { 
+            chunkId: chunk.id, 
+            error: simError 
+          });
+          similarity = 0;
+        }
+
+        return {
+          ...chunk,
+          similarity,
+        };
+      }).filter(chunk => chunk.similarity > 0.1); // Filter out very low similarity matches
+
+      // Sort by similarity and return top results
+      const topResults = scoredChunks
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, limit);
+
+      logger.info('Vector similarity search completed:', {
+        totalChunks: data.length,
+        scoredChunks: scoredChunks.length,
+        results: topResults.length,
+        topSimilarity: topResults[0]?.similarity || 0,
+        clientId: this.resolvedClientId,
+      });
+
+      return topResults;
+    } catch (error) {
+      logger.error('Error in vector similarity search:', { error });
+      return [];
+    }
+  }
+
+  /**
+   * Calculate cosine similarity between two vectors
+   */
+  private cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) {
+      throw new Error('Vector dimensions must match');
+    }
+
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+
+    if (normA === 0 || normB === 0) {
+      return 0;
+    }
+
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  /**
+   * Extract meaningful keywords from a search query
+   */
+  private extractKeywords(query: string): string[] {
+    // Convert to lowercase
+    const lowercaseQuery = query.toLowerCase();
+    
+    // Remove common stop words
+    const stopWords = new Set([
+      'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+      'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during',
+      'before', 'after', 'above', 'below', 'between', 'among', 'under', 'over',
+      'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+      'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+      'must', 'can', 'what', 'where', 'when', 'why', 'how', 'who', 'which',
+      'tell', 'me', 'you', 'i', 'we', 'they', 'them', 'us', 'it', 'this', 'that'
+    ]);
+
+    // Split into words and filter
+    const words = lowercaseQuery
+      .split(/\s+/)
+      .map(word => word.replace(/[^\w]/g, '')) // Remove punctuation
+      .filter(word => word.length > 2) // Remove very short words
+      .filter(word => !stopWords.has(word)) // Remove stop words
+      .filter(word => /^[a-zA-Z]/.test(word)); // Only words starting with letters
+
+    // Remove duplicates and return
+    return [...new Set(words)];
+  }
+
+  /**
+   * Remove duplicates and score results based on keyword relevance
+   */
+  private deduplicateAndScore(results: any[], keywords: string[], limit: number): any[] {
+    // Remove duplicates by ID
+    const uniqueById = new Map();
+    results.forEach(result => {
+      if (!uniqueById.has(result.id)) {
+        uniqueById.set(result.id, result);
+      }
+    });
+
+    const uniqueResults = Array.from(uniqueById.values());
+
+    // Score each result
+    const scoredResults = uniqueResults.map(result => {
+      let score = 0;
+      const content = result.content.toLowerCase();
+      const title = result.documents?.title?.toLowerCase() || '';
+
+      keywords.forEach(keyword => {
+        // Content matches (higher weight)
+        const contentMatches = (content.match(new RegExp(keyword, 'gi')) || []).length;
+        score += contentMatches * 3;
+
+        // Title matches (highest weight)
+        const titleMatches = (title.match(new RegExp(keyword, 'gi')) || []).length;
+        score += titleMatches * 5;
+      });
+
+      return { ...result, score };
+    });
+
+    // Sort by score and return top results
+    return scoredResults
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
   }
 
   async getDocumentsBySource(source: string): Promise<any[]> {
@@ -226,7 +457,7 @@ export class ClientDatabase {
       .from('documents')
       .delete()
       .eq('id', documentId)
-      .eq('client_id', this.clientId);
+      .eq('client_id', this.resolvedClientId);
 
     if (error) {
       logger.error('Error deleting document:', { error, documentId });
