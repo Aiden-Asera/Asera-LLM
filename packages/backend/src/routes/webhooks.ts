@@ -64,9 +64,9 @@ router.post('/notion', async (req: Request, res: Response) => {
     }
 
     // Handle webhook verification challenge
-    if (req.body.type === 'ping' || req.body.challenge) {
-      const challenge = req.body.challenge;
-      logger.info('Webhook verification challenge received:', { challenge });
+    if (req.body.type === 'ping' || req.body.challenge || req.body.verification_token) {
+      const challenge = req.body.challenge || req.body.verification_token;
+      logger.info('Webhook verification challenge received:', { challenge, type: req.body.type });
       
       if (challenge) {
         // Respond with the challenge token to verify the webhook
