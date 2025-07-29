@@ -1,0 +1,27 @@
+{
+  "name": "asera-llm-system",
+  "version": "1.0.0",
+  "description": "Multi-tenant AI chatbot system with Slack and Notion integrations",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "build": "npm run build --workspace=backend && npm run build --workspace=frontend",
+    "test": "npm run test --workspaces",
+    "lint": "npm run lint --workspaces",
+    "type-check": "npm run type-check --workspaces"
+  },
+  "devDependencies": {
+    "@types/node-cron": "^3.0.11",
+    "concurrently": "^8.2.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}

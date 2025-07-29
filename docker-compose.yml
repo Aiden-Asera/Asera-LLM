@@ -1,0 +1,107 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: asera_llm
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for rate limiting and caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      
+      # Database
+      SUPABASE_URL: http://localhost:5432  # Will be replaced with actual Supabase URL
+      SUPABASE_SERVICE_KEY: your-supabase-service-key
+      
+      # Redis
+      REDIS_URL: redis://redis:6379
+      
+      # JWT
+      JWT_SECRET: your-super-secret-jwt-key-change-this-in-production
+      JWT_EXPIRES_IN: 7d
+      
+      # Claude API
+      CLAUDE_API_KEY: your-claude-api-key
+      
+      # Integrations
+      SLACK_BOT_TOKEN: your-slack-bot-token
+      SLACK_APP_ID: your-slack-app-id
+      SLACK_SIGNING_SECRET: your-slack-signing-secret
+      NOTION_API_KEY: your-notion-api-key
+      
+      # Error tracking
+      SENTRY_DSN: your-sentry-dsn
+      
+      # Frontend URL for CORS
+      FRONTEND_URL: http://localhost:5173
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./packages/backend:/app
+      - /app/node_modules
+      - backend_logs:/app/logs
+    command: npm run dev
+    restart: unless-stopped
+
+  # Frontend React app
+  frontend:
+    build:
+      context: .
+      dockerfile: packages/frontend/Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:3000/api
+    depends_on:
+      - backend
+    volumes:
+      - ./packages/frontend:/app
+      - /app/node_modules
+    command: npm run dev
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_logs:
+
+networks:
+  default:
+    name: asera-llm-network 
