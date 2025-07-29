@@ -69,6 +69,15 @@ router.post('/notion', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString(),
     });
 
+    // Debug: Log the full webhook payload to understand structure
+    logger.info('Full webhook payload:', {
+      fullBody: JSON.stringify(req.body, null, 2),
+      bodyKeys: Object.keys(req.body),
+      hasPage: !!req.body.page,
+      hasEntity: !!req.body.entity,
+      hasData: !!req.body.data,
+    });
+
     // Process the webhook
     const result = await clientSyncService.handleWebhook(req.body);
 
