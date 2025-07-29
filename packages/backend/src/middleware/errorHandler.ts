@@ -1,20 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../utils/logger';
 import {
-  AseraError,
   AuthenticationError,
   AuthorizationError,
   ValidationError,
-  NotFoundError,
-  IntegrationError,
-} from 'shared';
+  ConflictError,
+  RateLimitError,
+  PayloadTooLargeError
+} from '../types/errors';
 
 export function errorHandler(
   error: Error,
   req: Request,
   res: Response,
   next: NextFunction
-): void {
+): Response | void {
   // If response was already sent, delegate to default Express error handler
   if (res.headersSent) {
     return next(error);
@@ -42,7 +42,57 @@ export function errorHandler(
   });
 
   // Handle known error types
-  if (error instanceof AseraError) {
+  if (error instanceof AuthenticationError) {
+    return res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+    });
+  }
+
+  if (error instanceof AuthorizationError) {
+    return res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+    });
+  }
+
+  if (error instanceof ValidationError) {
+    return res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+    });
+  }
+
+  if (error instanceof ConflictError) {
+    return res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+    });
+  }
+
+  if (error instanceof RateLimitError) {
+    return res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+    });
+  }
+
+  if (error instanceof PayloadTooLargeError) {
     return res.status(error.statusCode).json({
       error: {
         code: error.code,

@@ -4,7 +4,7 @@ import { supabase } from '../utils/database';
 import { generateToken } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import { asyncHandler } from '../middleware/errorHandler';
-import { AuthenticationError, ValidationError } from 'shared';
+import { AuthenticationError, ValidationError } from '../types/errors';
 
 const router = Router();
 
@@ -14,6 +14,10 @@ router.post('/login', asyncHandler(async (req: Request, res: Response) => {
 
   if (!email || !password) {
     throw new ValidationError('Email and password are required');
+  }
+
+  if (!supabase) {
+    throw new Error('Database not configured');
   }
 
   try {
@@ -77,6 +81,10 @@ router.post('/register', asyncHandler(async (req: Request, res: Response) => {
 
   if (!email || !password || !name || !clientId) {
     throw new ValidationError('Email, password, name, and clientId are required');
+  }
+
+  if (!supabase) {
+    throw new Error('Database not configured');
   }
 
   try {

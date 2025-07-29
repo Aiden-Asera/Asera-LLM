@@ -18,7 +18,10 @@ async function inspectDatabase() {
     });
 
     console.log('📋 Database Info:');
-    console.log(`   Name: ${database.title?.[0]?.plain_text || 'Untitled'}`);
+    const title = 'title' in database && database.title ? 
+      (database.title as any)[0]?.plain_text || 'Untitled' : 
+      'Untitled';
+    console.log(`   Name: ${title}`);
     console.log(`   ID: ${database.id}`);
     console.log(`   Properties: ${Object.keys(database.properties).length}\n`);
 

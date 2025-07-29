@@ -513,6 +513,45 @@ Answer:`;
     // but let RAG search handle it (it will find no context and respond normally)
     return false;
   }
+
+  /**
+   * Update document embeddings for a specific document.
+   */
+  async updateDocumentEmbeddings(clientDb: ClientDatabase, documentId: string, content: string): Promise<void> {
+    try {
+      logger.info('Updating document embeddings:', { documentId });
+
+      // Chunk the content
+      const chunks = this.chunkText(content);
+
+      // Delete existing chunks
+      await clientDb.queryInClientSchema('DELETE FROM document_chunks WHERE document_id = $1', [documentId]);
+
+      // Generate new embeddings
+      for (const chunk of chunks) {
+        try {
+          const embeddingResult = await claudeService.generateEmbedding(chunk.content);
+          
+          await clientDb.insertDocumentChunk({
+            id: `${documentId}-chunk-${chunk.index}`,
+            documentId: documentId,
+            content: chunk.content,
+            embedding: embeddingResult.embedding,
+            chunkIndex: chunk.index,
+            tokenCount: chunk.tokenCount,
+            metadata: {},
+          });
+        } catch (chunkError) {
+          logger.error('Error updating chunk embedding:', { error: chunkError, documentId, chunkIndex: chunk.index });
+        }
+      }
+
+      logger.info('Document embeddings updated successfully:', { documentId, chunksProcessed: chunks.length });
+    } catch (error) {
+      logger.error('Error updating document embeddings:', { error, documentId });
+      throw error;
+    }
+  }
 }
 
 export const ragService = RAGService.getInstance(); 

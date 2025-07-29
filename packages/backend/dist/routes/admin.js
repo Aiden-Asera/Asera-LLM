@@ -1,0 +1,501 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const syncScheduler_1 = require("../services/syncScheduler");
+const notion_1 = require("../services/notion");
+const rag_1 = require("../services/rag");
+const database_1 = require("../utils/database");
+const logger_1 = require("../utils/logger");
+const analytics_1 = require("../services/analytics");
+const upload_clients_1 = require("../scripts/upload-clients");
+const clientSync_1 = require("../services/clientSync");
+const supabase_js_1 = require("@supabase/supabase-js");
+const supabase = (0, supabase_js_1.createClient)(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const router = (0, express_1.Router)();
+// GET /api/admin/sync/status - Get sync scheduler status
+router.get('/sync/status', async (req, res) => {
+    try {
+        const stats = syncScheduler_1.syncScheduler.getStats();
+        const isHealthy = syncScheduler_1.syncScheduler.isHealthy();
+        res.json({
+            success: true,
+            data: {
+                isHealthy,
+                stats,
+                healthDetails: {
+                    hasRecentSync: stats.lastIncrementalSync || stats.lastFullSync ? true : false,
+                    successRate: stats.totalSyncs > 0
+                        ? `${((stats.totalSyncs - stats.failedSyncs) / stats.totalSyncs * 100).toFixed(1)}%`
+                        : '0%',
+                    lastSyncType: stats.lastIncrementalSync && stats.lastFullSync
+                        ? (stats.lastIncrementalSync > stats.lastFullSync ? 'incremental' : 'full')
+                        : stats.lastIncrementalSync ? 'incremental' : stats.lastFullSync ? 'full' : 'none',
+                },
+            },
+            timestamp: new Date().toISOString(),
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get sync status:', { error });
+        res.status(500).json({
+            error: 'Failed to get sync status',
+            message: error instanceof Error ? error.message : 'Unknown error',
+        });
+    }
+});
+// POST /api/admin/sync/trigger - Trigger manual sync
+router.post('/sync/trigger', async (req, res) => {
+    try {
+        const { type = 'incremental' } = req.body;
+        if (!['incremental', 'full'].includes(type)) {
+            return res.status(400).json({
+                error: 'Invalid sync type',
+                message: 'Type must be "incremental" or "full"',
+            });
+        }
+        logger_1.logger.info('Manual sync requested via API:', { type });
+        const result = await syncScheduler_1.syncScheduler.triggerManualSync(type);
+        res.json({
+            success: result.success,
+            data: {
+                message: result.message,
+                stats: result.stats,
+                syncType: type,
+            },
+            timestamp: new Date().toISOString(),
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to trigger manual sync:', { error });
+        res.status(500).json({
+            error: 'Failed to trigger sync',
+            message: error instanceof Error ? error.message : 'Unknown error',
+        });
+    }
+});
+// GET /api/admin/system/health - Get overall system health
+router.get('/system/health', async (req, res) => {
+    try {
+        const syncStats = syncScheduler_1.syncScheduler.getStats();
+        const syncHealthy = syncScheduler_1.syncScheduler.isHealthy();
+        // Get analytics metrics for health check
+        const analyticsMetrics = await analytics_1.analyticsService.getSearchMetrics('asera-master');
+        const systemHealth = {
+            status: syncHealthy && analyticsMetrics.totalSearches > 0 ? 'healthy' : 'warning',
+            components: {
+                sync: {
+                    status: syncHealthy ? 'healthy' : 'unhealthy',
+                    lastSync: syncStats.lastIncrementalSync || syncStats.lastFullSync,
+                    totalSyncs: syncStats.totalSyncs,
+                    failureRate: syncStats.totalSyncs > 0
+                        ? `${(syncStats.failedSyncs / syncStats.totalSyncs * 100).toFixed(1)}%`
+                        : '0%',
+                },
+                search: {
+                    status: analyticsMetrics.totalSearches > 0 ? 'healthy' : 'no_activity',
+                    totalSearches: analyticsMetrics.totalSearches,
+                    avgResponseTime: analyticsMetrics.avgResponseTime,
+                    successRate: `${analyticsMetrics.successRate}%`,
+                },
+                database: {
+                    status: 'connected', // Would check actual DB connection in production
+                    embeddings: 'claude-enhanced',
+                },
+                apis: {
+                    claude: process.env.CLAUDE_API_KEY ? 'configured' : 'missing',
+                    supabase: process.env.SUPABASE_URL ? 'configured' : 'missing',
+                    notion: process.env.NOTION_API_KEY ? 'configured' : 'missing',
+                },
+            },
+        };
+        res.json({
+            success: true,
+            data: systemHealth,
+            timestamp: new Date().toISOString(),
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get system health:', { error });
+        res.status(500).json({
+            error: 'Failed to get system health',
+            message: error instanceof Error ? error.message : 'Unknown error',
+        });
+    }
+});
+// POST /api/admin/test/rag - Test RAG functionality
+router.post('/test/rag', async (req, res) => {
+    try {
+        const { query, clientId = 'asera-master' } = req.body;
+        if (!query) {
+            return res.status(400).json({
+                error: 'Query is required'
+            });
+        }
+        const clientDb = new database_1.ClientDatabase(clientId);
+        // Test RAG response
+        const ragResponse = await rag_1.ragService.generateRAGResponse(clientDb, query, {
+            model: 'claude-3-haiku-20240307'
+        });
+        res.json({
+            success: true,
+            query,
+            clientId,
+            response: ragResponse,
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('RAG test failed:', { error });
+        res.status(500).json({
+            error: 'RAG test failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// GET /api/admin/debug/search - Debug search functionality
+router.get('/debug/search', async (req, res) => {
+    try {
+        const { query = 'asera', clientId = 'asera-master' } = req.query;
+        const clientDb = new database_1.ClientDatabase(clientId);
+        // Get all documents
+        const allDocs = await clientDb.getAllDocuments();
+        // Search for chunks
+        const chunks = await clientDb.searchSimilarChunks(query, 10);
+        // Search in document content directly
+        const docsWithContent = allDocs.filter(doc => doc.content?.toLowerCase().includes(query.toLowerCase()));
+        res.json({
+            success: true,
+            debug: {
+                query,
+                clientId,
+                totalDocuments: allDocs.length,
+                chunksFound: chunks.length,
+                documentsWithQueryInContent: docsWithContent.length,
+                documentTitles: allDocs.map(doc => ({
+                    id: doc.id,
+                    title: doc.title,
+                    source: doc.source,
+                    contentLength: doc.content?.length || 0,
+                    hasQueryInTitle: doc.title?.toLowerCase().includes(query.toLowerCase()),
+                    hasQueryInContent: doc.content?.toLowerCase().includes(query.toLowerCase())
+                })),
+                chunks: chunks.map(chunk => ({
+                    id: chunk.id,
+                    documentTitle: chunk.documents?.title,
+                    contentSnippet: chunk.content.substring(0, 200) + '...',
+                    chunkIndex: chunk.chunk_index
+                }))
+            },
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Debug search failed:', { error });
+        res.status(500).json({
+            error: 'Debug search failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// GET /api/admin/analytics/popular-queries - Get popular search queries
+router.get('/analytics/popular-queries', async (req, res) => {
+    try {
+        const { clientId = 'asera-master', limit = 10 } = req.query;
+        const popularQueries = await analytics_1.analyticsService.getPopularQueries(clientId, parseInt(limit));
+        res.json({
+            success: true,
+            data: {
+                popularQueries,
+                totalQueries: popularQueries.length,
+                clientId,
+            },
+            timestamp: new Date().toISOString(),
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get popular queries:', { error });
+        res.status(500).json({
+            error: 'Failed to get analytics',
+            message: error instanceof Error ? error.message : 'Unknown error',
+        });
+    }
+});
+// GET /api/admin/analytics/metrics - Get comprehensive search metrics
+router.get('/analytics/metrics', async (req, res) => {
+    try {
+        const { clientId = 'asera-master' } = req.query;
+        const metrics = await analytics_1.analyticsService.getSearchMetrics(clientId);
+        res.json({
+            success: true,
+            data: {
+                ...metrics,
+                clientId,
+            },
+            timestamp: new Date().toISOString(),
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get search metrics:', { error });
+        res.status(500).json({
+            error: 'Failed to get search metrics',
+            message: error instanceof Error ? error.message : 'Unknown error',
+        });
+    }
+});
+// GET /api/admin/analytics/trending - Get trending queries
+router.get('/analytics/trending', async (req, res) => {
+    try {
+        const { clientId = 'asera-master', limit = 5 } = req.query;
+        const trendingQueries = await analytics_1.analyticsService.getTrendingQueries(clientId, parseInt(limit));
+        res.json({
+            success: true,
+            data: {
+                trendingQueries,
+                clientId,
+                timeframe: 'last 24 hours vs previous 24 hours',
+            },
+            timestamp: new Date().toISOString(),
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get trending queries:', { error });
+        res.status(500).json({
+            error: 'Failed to get trending queries',
+            message: error instanceof Error ? error.message : 'Unknown error',
+        });
+    }
+});
+// POST /api/admin/test/notion - Test Notion integration
+router.post('/test/notion', async (req, res) => {
+    try {
+        const { databaseId, sourceType = 'notion_meeting_notes' } = req.body;
+        if (!databaseId) {
+            return res.status(400).json({
+                error: 'databaseId is required'
+            });
+        }
+        if (!['notion_meeting_notes', 'notion_client_page', 'notion_website_outline'].includes(sourceType)) {
+            return res.status(400).json({
+                error: 'Invalid sourceType'
+            });
+        }
+        // Test sync in background
+        notion_1.notionService.syncNotionDatabase(databaseId, sourceType).catch(error => {
+            logger_1.logger.error('Background Notion test failed:', { error, databaseId });
+        });
+        res.json({
+            success: true,
+            message: 'Notion sync test triggered',
+            databaseId,
+            sourceType,
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Notion test failed:', { error });
+        res.status(500).json({
+            error: 'Notion test failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// POST /api/admin/clients/mapping - Add client mapping for data routing
+router.post('/clients/mapping', async (req, res) => {
+    try {
+        const { clientId, clientName, notionKeywords } = req.body;
+        if (!clientId || !clientName || !Array.isArray(notionKeywords)) {
+            return res.status(400).json({
+                error: 'clientId, clientName, and notionKeywords (array) are required'
+            });
+        }
+        notion_1.notionService.addClientMapping({
+            clientId,
+            clientName,
+            notionKeywords
+        });
+        logger_1.logger.info('Client mapping added via admin API:', {
+            clientId,
+            clientName,
+            keywords: notionKeywords
+        });
+        res.json({
+            success: true,
+            message: 'Client mapping added successfully',
+            mapping: { clientId, clientName, notionKeywords },
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to add client mapping:', { error });
+        res.status(500).json({
+            error: 'Failed to add client mapping',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// GET /api/admin/clients/:clientId/documents - Get documents for a client
+router.get('/clients/:clientId/documents', async (req, res) => {
+    try {
+        const { clientId } = req.params;
+        const { source, limit = '50' } = req.query;
+        const clientDb = new database_1.ClientDatabase(clientId);
+        let documents;
+        if (source) {
+            documents = await clientDb.getDocumentsBySource(source);
+        }
+        else {
+            // Get all documents
+            documents = await clientDb.getAllDocuments();
+        }
+        // Limit results
+        const limitNum = parseInt(limit);
+        const limitedDocs = documents.slice(0, limitNum);
+        res.json({
+            success: true,
+            clientId,
+            documents: limitedDocs.map(doc => ({
+                id: doc.id,
+                title: doc.title,
+                source: doc.source,
+                contentLength: doc.content?.length || 0,
+                lastUpdated: doc.updated_at,
+                metadata: {
+                    sourceId: doc.source_id,
+                    syncedAt: doc.metadata?.syncedAt
+                }
+            })),
+            total: limitedDocs.length,
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get client documents:', {
+            error,
+            clientId: req.params.clientId
+        });
+        res.status(500).json({
+            error: 'Failed to get client documents',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// GET /api/admin/system/status - Get basic system status
+router.get('/system/status', (req, res) => {
+    const status = {
+        server: {
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            version: process.version,
+            environment: process.env.NODE_ENV || 'development'
+        },
+        integrations: {
+            claude: !!process.env.CLAUDE_API_KEY,
+            notion: !!process.env.NOTION_API_KEY,
+            supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY),
+        },
+        sync: {
+            isHealthy: syncScheduler_1.syncScheduler.isHealthy(),
+            stats: syncScheduler_1.syncScheduler.getStats(),
+        },
+        timestamp: new Date().toISOString()
+    };
+    res.json({
+        success: true,
+        status
+    });
+});
+// POST /api/admin/clients/upload-from-notion - Upload clients from Notion
+router.post('/clients/upload-from-notion', async (req, res) => {
+    try {
+        logger_1.logger.info('Client upload from Notion requested via API');
+        // Run the sync in background
+        (0, upload_clients_1.syncClientsFromNotion)().catch(error => {
+            logger_1.logger.error('Background client upload failed:', { error });
+        });
+        res.json({
+            success: true,
+            message: 'Client upload from Notion triggered successfully',
+            note: 'Check logs for progress and results',
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to trigger client upload:', { error });
+        res.status(500).json({
+            error: 'Failed to trigger client upload',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// POST /api/admin/clients/sync - Sync clients (incremental or full)
+router.post('/clients/sync', async (req, res) => {
+    try {
+        const { type = 'incremental', hoursBack = 2 } = req.body;
+        if (!['incremental', 'full'].includes(type)) {
+            return res.status(400).json({
+                error: 'Invalid sync type',
+                message: 'Type must be "incremental" or "full"',
+            });
+        }
+        logger_1.logger.info('Client sync requested via API:', { type, hoursBack });
+        let result;
+        if (type === 'full') {
+            result = await clientSync_1.clientSyncService.syncAllClients();
+        }
+        else {
+            const sinceDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
+            result = await clientSync_1.clientSyncService.syncUpdatedClients(sinceDate);
+        }
+        res.json({
+            success: result.success,
+            message: `${type} client sync completed`,
+            stats: result.stats,
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to sync clients:', { error });
+        res.status(500).json({
+            error: 'Failed to sync clients',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+// GET /api/admin/clients/status - Get client sync status
+router.get('/clients/status', async (req, res) => {
+    try {
+        // Get all clients from database
+        const { data: clients, error } = await supabase
+            .from('clients')
+            .select('id, name, slug, contact_email, updated_at, settings')
+            .order('updated_at', { ascending: false });
+        if (error) {
+            throw error;
+        }
+        const clientStats = {
+            totalClients: clients?.length || 0,
+            clientsWithEmail: clients?.filter(c => c.contact_email).length || 0,
+            clientsWithPageInfo: clients?.filter(c => c.settings?.client_page_info).length || 0,
+            lastUpdated: clients?.[0]?.updated_at || null,
+            recentUpdates: clients?.slice(0, 5).map((c) => ({
+                name: c.name,
+                slug: c.slug,
+                lastUpdated: c.updated_at,
+                hasEmail: !!c.contact_email,
+            })) || [],
+        };
+        res.json({
+            success: true,
+            data: clientStats,
+            timestamp: new Date().toISOString()
+        });
+    }
+    catch (error) {
+        logger_1.logger.error('Failed to get client status:', { error });
+        res.status(500).json({
+            error: 'Failed to get client status',
+            message: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
+});
+exports.default = router;

@@ -14,6 +14,9 @@ if (supabaseUrl && supabaseKey) {
   logger.warn('Supabase credentials not found - database operations will be disabled');
 }
 
+// Add this export near the top after supabase initialization (around line 15)
+export { supabase };
+
 // Client ID mapping - maps string identifiers to actual UUIDs
 const CLIENT_ID_MAP: Record<string, string> = {
   'asera-master': 'f47ac10b-58cc-4372-a567-0e02b2c3d479', // Demo client UUID from schema
@@ -461,6 +464,81 @@ export class ClientDatabase {
 
     if (error) {
       logger.error('Error deleting document:', { error, documentId });
+      throw error;
+    }
+  }
+
+  async queryInClientSchema(query: string, params: any[] = []): Promise<any[]> {
+    if (!supabase) {
+      logger.warn('Database query attempted but Supabase not configured');
+      return [];
+    }
+
+    try {
+      // For documents queries, convert to Supabase syntax
+      if (query.includes('FROM documents')) {
+        let queryBuilder = supabase
+          .from('documents')
+          .select('*')
+          .eq('client_id', this.resolvedClientId);
+
+        // Handle basic filtering
+        if (query.includes('AND source = ')) {
+          const sourceIndex = params.findIndex(p => typeof p === 'string' && 
+            ['slack', 'notion_meeting_notes', 'notion_client_page', 'notion_website_outline', 'upload'].includes(p));
+          if (sourceIndex !== -1) {
+            queryBuilder = queryBuilder.eq('source', params[sourceIndex]);
+          }
+        }
+
+        // Handle single document lookup
+        if (query.includes('WHERE id = ')) {
+          const idIndex = params.findIndex(p => typeof p === 'string' && p.length === 36);
+          if (idIndex !== -1) {
+            queryBuilder = queryBuilder.eq('id', params[idIndex]);
+          }
+        }
+
+        queryBuilder = queryBuilder.order('created_at', { ascending: false });
+
+        const { data, error } = await queryBuilder;
+        if (error) throw error;
+        return data || [];
+      }
+
+      // For document_chunks queries
+      if (query.includes('FROM document_chunks') || query.includes('DELETE FROM document_chunks')) {
+        if (query.includes('DELETE')) {
+          const documentIdIndex = params.findIndex(p => typeof p === 'string');
+          if (documentIdIndex !== -1) {
+            const { error } = await supabase
+              .from('document_chunks')
+              .delete()
+              .eq('document_id', params[documentIdIndex]);
+            if (error) throw error;
+          }
+          return [];
+        }
+      }
+
+      // For DELETE FROM documents
+      if (query.includes('DELETE FROM documents')) {
+        const documentIdIndex = params.findIndex(p => typeof p === 'string');
+        if (documentIdIndex !== -1) {
+          const { error } = await supabase
+            .from('documents')
+            .delete()
+            .eq('id', params[documentIdIndex])
+            .eq('client_id', this.resolvedClientId);
+          if (error) throw error;
+        }
+        return [];
+      }
+
+      logger.warn('Unsupported query pattern:', { query: query.substring(0, 100) });
+      return [];
+    } catch (error) {
+      logger.error('Error in queryInClientSchema:', { error });
       throw error;
     }
   }

@@ -1,8 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
+import * as jwt from 'jsonwebtoken';
 import { supabase } from '../utils/database';
 import { logger } from '../utils/logger';
-import { AuthenticationError, AuthorizationError } from 'shared';
+import { AuthenticationError, AuthorizationError } from '../types/errors';
 
 interface JWTPayload {
   userId: string;
@@ -48,6 +48,11 @@ export async function authMiddleware(
     
     if (!process.env.JWT_SECRET) {
       throw new Error('JWT_SECRET environment variable not configured');
+    }
+
+    // Check if supabase is available
+    if (!supabase) {
+      throw new Error('Database not configured');
     }
 
     // Verify JWT token
@@ -134,15 +139,14 @@ export function generateToken(user: {
     throw new Error('JWT_SECRET environment variable not configured');
   }
 
-  return jwt.sign(
-    {
-      userId: user.id,
-      clientId: user.clientId,
-      role: user.role,
-    },
-    process.env.JWT_SECRET,
-    {
-      expiresIn: process.env.JWT_EXPIRES_IN || '7d',
-    }
-  );
+  const payload = { 
+    userId: user.id, 
+    clientId: user.clientId,
+    role: user.role 
+  };
+  
+  const secret = process.env.JWT_SECRET;
+  const options = { expiresIn: process.env.JWT_EXPIRES_IN || '7d' };
+
+  return (jwt as any).sign(payload, secret, options);
 } 

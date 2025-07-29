@@ -264,8 +264,8 @@ export class NotionService {
 
     try {
       const filter = sinceDate ? {
-        property: 'Last edited time',
-        date: {
+        timestamp: 'last_edited_time' as const,
+        last_edited_time: {
           after: sinceDate.toISOString(),
         },
       } : undefined;

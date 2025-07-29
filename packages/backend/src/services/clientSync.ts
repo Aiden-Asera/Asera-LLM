@@ -481,16 +481,24 @@ export class ClientSyncService {
     try {
       logger.info('Starting incremental client sync from Notion...', { sinceDate });
 
-      // For now, sync all clients since we can't filter by date
-      // This is because the database doesn't have a "Last edited time" property
+      // Query for updated clients using last_edited_time filter
+      const filter = {
+        timestamp: 'last_edited_time' as const,
+        last_edited_time: {
+          after: sinceDate.toISOString(),
+        },
+      };
+
       const response = await notion.databases.query({
         database_id: this.databaseId,
+        filter,
         page_size: 100,
       });
 
       stats.total = response.results.length;
       logger.info(`Found ${stats.total} updated clients in Notion database`);
 
+      // First, sync all updated/new clients
       for (const page of response.results) {
         if (page.object === 'page' && 'properties' in page) {
           const result = await this.syncClient(page.id);
@@ -500,24 +508,110 @@ export class ClientSyncService {
             else if (result.action === 'updated') stats.updated++;
             else stats.skipped++;
           } else {
-            stats.skipped++;
-            if (result.error) stats.errors.push(result.error);
+            stats.errors.push(result.error || 'Unknown sync error');
           }
-
-          // Small delay to avoid rate limiting
-          await this.delay(500);
         }
       }
 
-      logger.info('Incremental client sync completed:', stats);
+      // Next, check for deletions by comparing existing clients with current Notion pages
+      await this.checkForDeletedClients(stats);
+
+      logger.info('Incremental client sync completed:', {
+        total: stats.total,
+        created: stats.created,
+        updated: stats.updated,
+        skipped: stats.skipped,
+        errors: stats.errors.length,
+      });
+
       return { success: true, stats };
+
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      stats.errors.push(errorMsg);
-      logger.error('Incremental client sync failed:', { error });
+      logger.error('Error in incremental client sync:', { error });
+      stats.errors.push(error instanceof Error ? error.message : 'Unknown error');
       return { success: false, stats };
     } finally {
       this.syncInProgress = false;
+    }
+  }
+
+  /**
+   * Check for clients that have been deleted from Notion
+   */
+  private async checkForDeletedClients(stats: {
+    total: number;
+    created: number;
+    updated: number;
+    skipped: number;
+    errors: string[];
+  }): Promise<void> {
+    try {
+      // Get all current clients from Supabase that have notion_page_id in settings
+      const { data: existingClients, error } = await supabase
+        .from('clients')
+        .select('id, name, settings')
+        .not('settings->notion_page_id', 'is', null);
+
+      if (error) {
+        logger.error('Error fetching existing clients for deletion check:', { error });
+        stats.errors.push(`Deletion check failed: ${error.message}`);
+        return;
+      }
+
+      if (!existingClients || existingClients.length === 0) {
+        logger.info('No clients with Notion page IDs found for deletion check');
+        return;
+      }
+
+      logger.info(`Checking ${existingClients.length} clients for deletions from Notion`);
+
+      // Check each client to see if it still exists in Notion
+      for (const client of existingClients) {
+        const notionPageId = client.settings?.notion_page_id;
+        if (!notionPageId) continue;
+
+        try {
+          // Try to retrieve the page from Notion
+          await notion.pages.retrieve({ page_id: notionPageId });
+          // If we get here, page still exists - no action needed
+        } catch (notionError: any) {
+          // If page is not found (404), it was deleted
+          if (notionError?.status === 404 || notionError?.code === 'object_not_found') {
+            logger.info(`Notion page deleted, removing client: ${client.name}`, {
+              clientId: client.id,
+              notionPageId: notionPageId
+            });
+
+            // Delete the client from Supabase
+            const { error: deleteError } = await supabase
+              .from('clients')
+              .delete()
+              .eq('id', client.id);
+
+            if (deleteError) {
+              logger.error('Error deleting client:', { error: deleteError, clientId: client.id });
+              stats.errors.push(`Failed to delete client ${client.name}: ${deleteError.message}`);
+            } else {
+              logger.info(`Successfully deleted client: ${client.name}`, { clientId: client.id });
+              // You might want to add a 'deleted' counter to stats in the future
+            }
+          } else {
+            // Some other error (rate limit, network, etc.)
+            logger.warn('Error checking Notion page, skipping deletion check:', {
+              error: notionError,
+              clientId: client.id,
+              notionPageId: notionPageId
+            });
+          }
+        }
+
+        // Small delay to avoid rate limiting
+        await this.delay(200);
+      }
+
+    } catch (error) {
+      logger.error('Error in deletion check:', { error });
+      stats.errors.push(`Deletion check error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -638,20 +732,10 @@ export class ClientSyncService {
       if (!databaseId) {
         try {
           const pageInfo = await notion.pages.retrieve({ page_id: pageId });
-          if (pageInfo.object === 'page' && pageInfo.parent?.type === 'database_id') {
-            databaseId = pageInfo.parent.database_id;
-            
-            if (databaseId !== this.databaseId) {
-              logger.info('Webhook ignored: page not from clients database (verified via API)', { 
-                receivedDatabaseId: databaseId, 
-                expectedDatabaseId: this.databaseId,
-                pageId,
-                type 
-              });
-              return { 
-                success: true, 
-                message: `Webhook ignored: page not from clients database (${databaseId})` 
-              };
+          if (pageInfo.object === 'page' && 'parent' in pageInfo && pageInfo.parent && typeof pageInfo.parent === 'object') {
+            const parent = pageInfo.parent as any;
+            if (parent.type === 'database_id') {
+              databaseId = parent.database_id;
             }
           }
         } catch (error) {
