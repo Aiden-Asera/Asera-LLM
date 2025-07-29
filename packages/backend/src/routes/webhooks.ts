@@ -63,6 +63,24 @@ router.post('/notion', async (req: Request, res: Response) => {
       logger.info('Private integration detected, skipping signature verification');
     }
 
+    // Handle webhook verification challenge
+    if (req.body.type === 'ping' || req.body.challenge) {
+      const challenge = req.body.challenge;
+      logger.info('Webhook verification challenge received:', { challenge });
+      
+      if (challenge) {
+        // Respond with the challenge token to verify the webhook
+        return res.status(200).json({ challenge });
+      } else {
+        // Simple ping response
+        return res.status(200).json({ 
+          success: true, 
+          message: 'Webhook endpoint verified',
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+
     logger.info('Received Notion webhook:', {
       type: req.body.type,
       pageId: req.body.page?.id,
