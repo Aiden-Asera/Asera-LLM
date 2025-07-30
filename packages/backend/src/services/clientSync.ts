@@ -676,6 +676,12 @@ export class ClientSyncService {
       let pageId: string | undefined;
       let databaseId: string | undefined;
 
+      // Handle ping webhooks (Notion's health check)
+      if (type === 'ping') {
+        logger.info('Received ping webhook from Notion');
+        return { success: true, message: 'Ping received and acknowledged' };
+      }
+
       // Extract page ID and database ID based on webhook type
       if (type === 'page.deleted') {
         pageId = entity?.id;

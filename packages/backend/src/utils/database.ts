@@ -39,6 +39,7 @@ function resolveClientId(clientId: string): string {
     return CLIENT_ID_MAP['asera-master'];
   }
   
+  logger.info('Resolved client ID:', { original: clientId, resolved: mappedId });
   return mappedId;
 }
 

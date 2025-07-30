@@ -12,6 +12,7 @@
     "type-check": "tsc --noEmit",
     "upload-clients": "tsx src/scripts/upload-clients.ts",
     "test-webhook": "tsx src/scripts/test-webhook.ts",
+    "test-webhook-endpoint": "./test-webhook-endpoint.sh",
     "test-delete": "tsx src/scripts/test-delete-webhook.ts",
     "test-db-filter": "tsx src/scripts/test-database-filter.ts",
     "setup-webhook": "./setup-webhook.sh",

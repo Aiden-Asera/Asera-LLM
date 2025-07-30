@@ -8,7 +8,16 @@ async function testWebhook() {
   try {
     logger.info('Testing webhook functionality...');
 
-    // Test 1: Simulate a page.updated webhook
+    // Test 1: Simulate Notion verification request
+    const verificationWebhook = {
+      verification_token: 'test-verification-token-123'
+    };
+
+    logger.info('Testing Notion verification webhook...');
+    const verificationResult = await clientSyncService.handleWebhook(verificationWebhook);
+    logger.info('Verification webhook result:', verificationResult);
+
+    // Test 2: Simulate a page.updated webhook
     const updateWebhook = {
       type: 'page.updated',
       page: {
@@ -28,7 +37,7 @@ async function testWebhook() {
     const updateResult = await clientSyncService.handleWebhook(updateWebhook);
     logger.info('Update webhook result:', updateResult);
 
-    // Test 2: Simulate a page.created webhook
+    // Test 3: Simulate a page.created webhook
     const createWebhook = {
       type: 'page.created',
       page: {
@@ -48,7 +57,7 @@ async function testWebhook() {
     const createResult = await clientSyncService.handleWebhook(createWebhook);
     logger.info('Create webhook result:', createResult);
 
-    // Test 3: Test with invalid data
+    // Test 4: Test with invalid data
     const invalidWebhook = {
       type: 'page.updated',
       page: null
@@ -57,6 +66,15 @@ async function testWebhook() {
     logger.info('Testing invalid webhook...');
     const invalidResult = await clientSyncService.handleWebhook(invalidWebhook);
     logger.info('Invalid webhook result:', invalidResult);
+
+    // Test 5: Test ping webhook
+    const pingWebhook = {
+      type: 'ping'
+    };
+
+    logger.info('Testing ping webhook...');
+    const pingResult = await clientSyncService.handleWebhook(pingWebhook);
+    logger.info('Ping webhook result:', pingResult);
 
     logger.info('Webhook tests completed successfully!');
 

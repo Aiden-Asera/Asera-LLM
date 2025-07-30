@@ -50,8 +50,21 @@ function verifyNotionWebhook(request: Request, body: string): boolean {
  */
 router.post('/notion', async (req: Request, res: Response) => {
   try {
+    logger.info('Webhook received:', { 
+      headers: req.headers,
+      bodyKeys: Object.keys(req.body),
+      hasVerificationToken: !!req.body.verification_token,
+      type: req.body.type 
+    });
+
     const body = JSON.stringify(req.body);
     
+    // Handle Notion's verification requests first
+    if (req.body.verification_token) {
+      logger.info('Handling Notion verification request');
+      return res.status(200).json({ challenge: req.body.verification_token });
+    }
+
     // For private integrations, skip signature verification
     // Private integrations don't provide webhook secrets
     if (process.env.NOTION_WEBHOOK_SECRET) {
@@ -59,12 +72,6 @@ router.post('/notion', async (req: Request, res: Response) => {
         logger.warn('Invalid webhook signature, rejecting request');
         return res.status(401).json({ error: 'Invalid signature' });
       }
-    }
-
-    // Handle verification silently
-    if (req.body.verification_token && !req.body.type) {
-      // Silent verification response
-      return res.status(200).json({ challenge: req.body.verification_token });
     }
 
     // Only log meaningful webhooks
@@ -91,7 +98,11 @@ router.post('/notion', async (req: Request, res: Response) => {
       });
     }
   } catch (error) {
-    logger.error('Error processing webhook:', { error });
+    logger.error('Error processing webhook:', { 
+      error, 
+      stack: error instanceof Error ? error.stack : undefined,
+      body: req.body 
+    });
     res.status(500).json({
       success: false,
       error: 'Internal server error',
