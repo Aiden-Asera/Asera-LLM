@@ -702,9 +702,12 @@ export class ClientSyncService {
       if (type === 'page.deleted') {
         pageId = entity?.id;
         databaseId = data?.parent?.id;
-      } else if (type === 'page.updated' || type === 'page.created' || type === 'page.properties_updated') {
+      } else if (type === 'page.updated' || type === 'page.created') {
         pageId = page?.id;
         databaseId = page?.parent?.database_id;
+      } else if (type === 'page.properties_updated') {
+        pageId = entity?.id;
+        databaseId = data?.parent?.id;
       } else if (type === 'page.content_updated') {
         pageId = entity?.id;
         databaseId = data?.parent?.id;
@@ -747,6 +750,7 @@ export class ClientSyncService {
       switch (type) {
         case 'page.updated':
         case 'page.content_updated':
+        case 'page.properties_updated':
           const result = await this.syncClient(pageId);
           if (result.success) {
             const action = result.action === 'created' ? 'created' : 'updated';
