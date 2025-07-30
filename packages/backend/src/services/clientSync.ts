@@ -253,7 +253,7 @@ export class ClientSyncService {
   async syncClient(notionPageId: string): Promise<{
     success: boolean;
     client?: any;
-    action?: 'created' | 'updated';
+    action?: 'created' | 'updated' | 'skipped';
     error?: string;
   }> {
     try {
