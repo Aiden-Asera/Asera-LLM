@@ -702,7 +702,7 @@ export class ClientSyncService {
       if (type === 'page.deleted') {
         pageId = entity?.id;
         databaseId = data?.parent?.id;
-      } else if (type === 'page.updated' || type === 'page.created') {
+      } else if (type === 'page.updated' || type === 'page.created' || type === 'page.properties_updated') {
         pageId = page?.id;
         databaseId = page?.parent?.database_id;
       } else if (type === 'page.content_updated') {

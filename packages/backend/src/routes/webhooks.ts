@@ -59,42 +59,18 @@ router.post('/notion', async (req: Request, res: Response) => {
         logger.warn('Invalid webhook signature, rejecting request');
         return res.status(401).json({ error: 'Invalid signature' });
       }
-    } else {
-      logger.info('Private integration detected, skipping signature verification');
     }
 
-    // Handle webhook verification challenge
-    if (req.body.type === 'ping' || req.body.challenge || req.body.verification_token) {
-      const challenge = req.body.challenge || req.body.verification_token;
-      logger.info('Webhook verification challenge received:', { challenge, type: req.body.type });
-      
-      if (challenge) {
-        // Respond with the challenge token to verify the webhook
-        return res.status(200).json({ challenge });
-      } else {
-        // Simple ping response
-        return res.status(200).json({ 
-          success: true, 
-          message: 'Webhook endpoint verified',
-          timestamp: new Date().toISOString()
-        });
-      }
+    // Handle verification silently
+    if (req.body.verification_token && !req.body.type) {
+      // Silent verification response
+      return res.status(200).json({ challenge: req.body.verification_token });
     }
 
-    logger.info('Received Notion webhook:', {
-      type: req.body.type,
-      pageId: req.body.page?.id,
-      timestamp: new Date().toISOString(),
-    });
-
-    // Debug: Log the full webhook payload to understand structure
-    logger.info('Full webhook payload:', {
-      fullBody: JSON.stringify(req.body, null, 2),
-      bodyKeys: Object.keys(req.body),
-      hasPage: !!req.body.page,
-      hasEntity: !!req.body.entity,
-      hasData: !!req.body.data,
-    });
+    // Only log meaningful webhooks
+    if (req.body.type && req.body.type !== 'ping') {
+      logger.info('Processing Notion webhook:', { type: req.body.type });
+    }
 
     // Process the webhook
     const result = await clientSyncService.handleWebhook(req.body);
