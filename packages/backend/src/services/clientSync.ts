@@ -199,73 +199,50 @@ export class ClientSyncService {
    */
   private async getExistingClient(notionPageId: string): Promise<any> {
     try {
-      // First try to find by exact Notion page ID match
+      logger.info('Looking up client by notion_page_id:', { notionPageId });
+      // First try the new dedicated column
       let { data, error } = await supabase
         .from('clients')
         .select('*')
-        .eq('settings->notion_page_id', notionPageId)
+        .eq('notion_page_id', notionPageId)
         .single();
 
-      if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
-        logger.error('Error fetching existing client by notion_page_id:', { error, notionPageId });
-        return null;
-      }
-
-      if (data) {
-        logger.info('Found existing client by notion_page_id:', { clientId: data.id, notionPageId });
+      if (!error && data) {
+        logger.info('Found existing client by notion_page_id:', { 
+          clientId: data.id, 
+          notionPageId 
+        });
         return data;
       }
 
-      // If not found, try to find by slug (fallback for existing clients)
-      // This handles the case where clients were uploaded before webhook setup
-      logger.info('Client not found by notion_page_id, trying to find by slug...', { notionPageId });
-      
-      // Get the page from Notion to extract the name
-      const page = await notion.pages.retrieve({ page_id: notionPageId });
-      if (page.object === 'page' && 'properties' in page) {
-        const name = this.extractClientName(page.properties);
-        if (name && name !== 'Unknown Client') {
-          const slug = this.generateSlug(name);
-          
-          // Try to find by slug
-          const { data: slugData, error: slugError } = await supabase
-            .from('clients')
-            .select('*')
-            .eq('slug', slug)
-            .single();
+      logger.info('No existing client found for notion_page_id:', { notionPageId });
 
-          if (slugError && slugError.code !== 'PGRST116') {
-            logger.error('Error fetching existing client by slug:', { error: slugError, slug });
-            return null;
-          }
+      // Fallback to JSON field for backward compatibility
+      ({ data, error } = await supabase
+        .from('clients')
+        .select('*')
+        .eq('settings->notion_page_id', notionPageId)
+        .single());
 
-          if (slugData) {
-            logger.info('Found existing client by slug, updating notion_page_id:', { 
-              clientId: slugData.id, 
-              slug, 
-              notionPageId 
-            });
-            
-            // Update the client with the Notion page ID for future lookups
-            await supabase
-              .from('clients')
-              .update({
-                settings: {
-                  ...slugData.settings,
-                  notion_page_id: notionPageId,
-                  last_synced_at: new Date().toISOString(),
-                }
-              })
-              .eq('id', slugData.id);
-            
-            return slugData;
-          }
-        }
+      if (!error && data) {
+        logger.info('Found existing client by JSON notion_page_id:', { 
+          clientId: data.id, 
+          notionPageId 
+        });
+        
+        // Migrate to the new column
+        await supabase
+          .from('clients')
+          .update({ notion_page_id: notionPageId })
+          .eq('id', data.id);
+        
+        return data;
       }
 
+      logger.info('No existing client found for notion_page_id:', { notionPageId });
       return null;
     } catch (error) {
-      logger.error('Error in getExistingClient:', { error, notionPageId });
+      logger.error('Error fetching existing client:', { error, notionPageId });
       return null;
     }
   }
@@ -275,11 +252,12 @@ export class ClientSyncService {
    */
   async syncClient(notionPageId: string): Promise<{
     success: boolean;
-    action: 'created' | 'updated' | 'skipped';
     client?: any;
+    action?: 'created' | 'updated';
     error?: string;
   }> {
     try {
+      logger.info('Starting client sync:', { notionPageId });
       // Get the page from Notion
       const page = await notion.pages.retrieve({ page_id: notionPageId });
       
@@ -713,8 +691,44 @@ export class ClientSyncService {
         databaseId = data?.parent?.id;
       }
 
+      // Enhanced debugging for property updates specifically
+      if (type === 'page.properties_updated') {
+        logger.info('Property update webhook received:', {
+          type,
+          pageId,
+          databaseId,
+          hasUpdatedProperties: !!(data?.updated_properties),
+          updatedPropertiesCount: data?.updated_properties?.length || 0,
+          updatedProperties: data?.updated_properties,
+          entityId: entity?.id,
+          parentType: data?.parent?.type,
+          parentId: data?.parent?.id
+        });
+      }
+
+      // Log successful page ID extraction for all webhook types
+      logger.info('Webhook page ID extracted successfully:', {
+        type,
+        pageId,
+        databaseId,
+        extractionMethod: type === 'page.properties_updated' || type === 'page.content_updated' || type === 'page.deleted' ? 'entity.id' : 'page.id'
+      });
+
       if (!pageId) {
-        return { success: false, message: 'Invalid webhook: no page ID found' };
+        logger.error('Webhook page ID extraction failed:', {
+          type,
+          hasEntity: !!entity,
+          hasPage: !!page,
+          hasData: !!data,
+          entityId: entity?.id,
+          pageId: page?.id,
+          webhookStructure: {
+            entityType: entity?.type,
+            dataKeys: data ? Object.keys(data) : [],
+            parentType: data?.parent?.type
+          }
+        });
+        return { success: false, message: `Invalid webhook: no page ID found for type ${type}` };
       }
 
       // Validate that this webhook is from the clients database
