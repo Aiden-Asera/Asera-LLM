@@ -34,6 +34,7 @@ function resolveClientId(clientId) {
         logger_1.logger.warn('Unknown client ID, using demo client:', { clientId });
         return CLIENT_ID_MAP['asera-master'];
     }
+    logger_1.logger.info('Resolved client ID:', { original: clientId, resolved: mappedId });
     return mappedId;
 }
 // Simple database utility for when Supabase is not configured

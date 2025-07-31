@@ -195,48 +195,58 @@ export class ClientSyncService {
   }
 
   /**
+   * Extract base name by removing numbers and extra text (e.g., "Hockey Think Tank 123" -> "Hockey Think Tank")
+   */
+  private extractBaseName(name: string): string {
+    // Remove numbers at the end (e.g., "Name 123" -> "Name")
+    let baseName = name.replace(/\s+\d+$/, '');
+    
+    // Remove common suffixes like " - Extra", " (Copy)", etc.
+    baseName = baseName.replace(/\s*[-–—]\s*\w+$/, '');
+    baseName = baseName.replace(/\s*\(\s*\w+\s*\)$/, '');
+    
+    // Remove trailing spaces
+    baseName = baseName.trim();
+    
+    return baseName;
+  }
+
+  /**
    * Get existing client from Supabase by Notion page ID
+   * CRITICAL: Only uses JSON field since notion_page_id column doesn't exist in schema
    */
   private async getExistingClient(notionPageId: string): Promise<any> {
     try {
       logger.info('Looking up client by notion_page_id:', { notionPageId });
-      // First try the new dedicated column
-      let { data, error } = await supabase
+      
+      // Search in JSON settings field (the ONLY place this data exists)
+      // Use ->> for text extraction instead of -> for JSON extraction
+      const { data, error } = await supabase
         .from('clients')
         .select('*')
-        .eq('notion_page_id', notionPageId)
-        .single();
+        .eq('settings->>notion_page_id', notionPageId)
+        .order('created_at', { ascending: true }); // Get oldest first
 
-      if (!error && data) {
-        logger.info('Found existing client by notion_page_id:', { 
-          clientId: data.id, 
-          notionPageId 
-        });
-        return data;
-      }
-
-      logger.info('No existing client found for notion_page_id:', { notionPageId });
-
-      // Fallback to JSON field for backward compatibility
-      ({ data, error } = await supabase
-        .from('clients')
-        .select('*')
-        .eq('settings->notion_page_id', notionPageId)
-        .single());
-
-      if (!error && data) {
-        logger.info('Found existing client by JSON notion_page_id:', { 
-          clientId: data.id, 
-          notionPageId 
-        });
+      if (!error && data && data.length > 0) {
+        // If multiple clients have the same notion_page_id (duplicates), use the oldest one
+        const primaryClient = data[0];
         
-        // Migrate to the new column
-        await supabase
-          .from('clients')
-          .update({ notion_page_id: notionPageId })
-          .eq('id', data.id);
+        if (data.length > 1) {
+          logger.warn('Multiple clients found with same notion_page_id - using oldest:', { 
+            notionPageId,
+            totalFound: data.length,
+            primaryClientId: primaryClient.id,
+            primaryClientName: primaryClient.name,
+            duplicateIds: data.slice(1).map(c => ({ id: c.id, name: c.name }))
+          });
+        } else {
+          logger.info('Found existing client by JSON notion_page_id:', { 
+            clientId: primaryClient.id, 
+            notionPageId 
+          });
+        }
         
-        return data;
+        return primaryClient;
       }
 
       logger.info('No existing client found for notion_page_id:', { notionPageId });
@@ -247,8 +257,232 @@ export class ClientSyncService {
     }
   }
 
+
+
   /**
-   * Sync a single client from Notion
+   * Calculate similarity between two names (0-1 scale) - ENHANCED for better matching
+   */
+  private calculateNameSimilarity(name1: string, name2: string): number {
+    const normalize = (str: string) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const n1 = normalize(name1);
+    const n2 = normalize(name2);
+    
+    if (n1 === n2) return 1;
+    
+    // Check if one contains the other (e.g., "Hockey Think Tank" vs "Hockey Think Tank 123")
+    if (n1.includes(n2) || n2.includes(n1)) {
+      const shorter = n1.length < n2.length ? n1 : n2;
+      const longer = n1.length < n2.length ? n2 : n1;
+      const ratio = shorter.length / longer.length;
+      // Higher score for longer matches, but still good for shorter ones
+      return ratio > 0.7 ? 0.95 : 0.85;
+    }
+    
+    // Check for common patterns like "Name" vs "Name 123" or "Name" vs "Name - Extra"
+    const words1 = n1.split(' ').filter(w => w.length > 0);
+    const words2 = n2.split(' ').filter(w => w.length > 0);
+    
+    // If one is a subset of the other (e.g., ["hockey", "think", "tank"] vs ["hockey", "think", "tank", "123"])
+    if (words1.length > 0 && words2.length > 0) {
+      const shorter = words1.length < words2.length ? words1 : words2;
+      const longer = words1.length < words2.length ? words2 : words1;
+      
+      const commonWords = shorter.filter(word => longer.includes(word));
+      if (commonWords.length === shorter.length && commonWords.length >= 2) {
+        const extraWords = longer.filter(word => !shorter.includes(word));
+        // If extra words are just numbers or short additions, give high similarity
+        const isJustNumbers = extraWords.every(word => /^\d+$/.test(word) || word.length <= 3);
+        if (isJustNumbers) {
+          return 0.9;
+        }
+      }
+    }
+    
+    // Simple Levenshtein-like similarity
+    const longer = n1.length > n2.length ? n1 : n2;
+    const shorter = n1.length > n2.length ? n2 : n1;
+    
+    if (longer.length === 0) return 1;
+    
+    const distance = this.levenshteinDistance(longer, shorter);
+    return (longer.length - distance) / longer.length;
+  }
+
+  /**
+   * Calculate Levenshtein distance between two strings
+   */
+  private levenshteinDistance(str1: string, str2: string): number {
+    const matrix = [];
+    
+    for (let i = 0; i <= str2.length; i++) {
+      matrix[i] = [i];
+    }
+    
+    for (let j = 0; j <= str1.length; j++) {
+      matrix[0][j] = j;
+    }
+    
+    for (let i = 1; i <= str2.length; i++) {
+      for (let j = 1; j <= str1.length; j++) {
+        if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+          matrix[i][j] = matrix[i - 1][j - 1];
+        } else {
+          matrix[i][j] = Math.min(
+            matrix[i - 1][j - 1] + 1,
+            matrix[i][j - 1] + 1,
+            matrix[i - 1][j] + 1
+          );
+        }
+      }
+    }
+    
+    return matrix[str2.length][str1.length];
+  }
+
+  /**
+   * Find ANY existing client that matches this Notion data - comprehensive search
+   */
+  private async findAnyMatchingClient(notionPageId: string, name: string, contactEmail: string): Promise<any> {
+    logger.info('Comprehensive client search:', { notionPageId, name, contactEmail });
+
+    // 1. Primary: Check by notion_page_id
+    let existingClient = await this.getExistingClient(notionPageId);
+    if (existingClient) {
+      logger.info('Found client by notion_page_id:', { clientId: existingClient.id, name: existingClient.name });
+      return existingClient;
+    }
+
+    // 2. Secondary: Check by exact name match
+    const { data: exactNameMatch, error: nameError } = await supabase
+      .from('clients')
+      .select('*')
+      .eq('name', name)
+      .single();
+
+    if (!nameError && exactNameMatch) {
+      logger.info('Found client by exact name match:', { clientId: exactNameMatch.id, name: exactNameMatch.name });
+      return exactNameMatch;
+    }
+
+    // 3. Tertiary: Check by contact email if available
+    if (contactEmail) {
+      const { data: emailMatch, error: emailError } = await supabase
+        .from('clients')
+        .select('*')
+        .eq('contact_email', contactEmail)
+        .single();
+
+      if (!emailError && emailMatch) {
+        logger.info('Found client by contact email:', { clientId: emailMatch.id, email: contactEmail });
+        return emailMatch;
+      }
+    }
+
+    // 4. Quaternary: Fuzzy name matching for similar names
+    if (name.length > 3) {
+      const nameWords = name.toLowerCase().split(' ').filter(word => word.length > 2);
+      if (nameWords.length > 0) {
+        const { data: similarClients, error: similarError } = await supabase
+          .from('clients')
+          .select('*')
+          .or(nameWords.map(word => `name.ilike.%${word}%`).join(','));
+
+        if (!similarError && similarClients && similarClients.length > 0) {
+          // Find the best match by comparing name similarity
+          const bestMatch = similarClients.reduce((best, current) => {
+            const currentSimilarity = this.calculateNameSimilarity(name, current.name);
+            const bestSimilarity = best ? this.calculateNameSimilarity(name, best.name) : 0;
+            return currentSimilarity > bestSimilarity ? current : best;
+          });
+
+          // More lenient similarity threshold to catch cases like "Hockey Think Tank" vs "Hockey Think Tank 123"
+          const similarity = this.calculateNameSimilarity(name, bestMatch.name);
+          if (similarity > 0.75) {
+            logger.info('Found client by fuzzy name match:', { 
+              clientId: bestMatch.id, 
+              originalName: bestMatch.name,
+              newName: name,
+              similarity: similarity,
+              threshold: 0.75
+            });
+            return bestMatch;
+          } else {
+            logger.info('Fuzzy match found but below threshold:', {
+              clientId: bestMatch.id,
+              originalName: bestMatch.name,
+              newName: name,
+              similarity: similarity,
+              threshold: 0.75
+            });
+          }
+        }
+      }
+    }
+
+    // 5. Check for clients with same slug pattern
+    const potentialSlug = this.generateSlug(name);
+    const { data: slugMatches, error: slugError } = await supabase
+      .from('clients')
+      .select('*')
+      .like('slug', `${potentialSlug}%`);
+
+    if (!slugError && slugMatches && slugMatches.length > 0) {
+      // Look for exact slug match or base slug (without numbers)
+      const exactSlugMatch = slugMatches.find(client => client.slug === potentialSlug);
+      if (exactSlugMatch) {
+        logger.info('Found client by exact slug match:', { clientId: exactSlugMatch.id, slug: exactSlugMatch.slug });
+        return exactSlugMatch;
+      }
+
+      // Look for base slug match (original without numbers)
+      const baseSlugMatch = slugMatches.find(client => 
+        client.slug === potentialSlug && !client.slug.match(/-\d+$/)
+      );
+      if (baseSlugMatch) {
+        logger.info('Found client by base slug match:', { clientId: baseSlugMatch.id, slug: baseSlugMatch.slug });
+        return baseSlugMatch;
+      }
+    }
+
+    // 6. Last resort: Check for base name similarity (strip numbers and extra text)
+    const baseName = this.extractBaseName(name);
+    if (baseName && baseName !== name) {
+      logger.info('Checking base name similarity:', { originalName: name, baseName });
+      
+      const { data: baseNameMatches, error: baseNameError } = await supabase
+        .from('clients')
+        .select('*')
+        .or(baseName.split(' ').map((word: string) => `name.ilike.%${word}%`).join(','));
+
+      if (!baseNameError && baseNameMatches && baseNameMatches.length > 0) {
+        // Find the best match by comparing base name similarity
+        const bestBaseMatch = baseNameMatches.reduce((best, current) => {
+          const currentBaseName = this.extractBaseName(current.name);
+          const currentSimilarity = this.calculateNameSimilarity(baseName, currentBaseName);
+          const bestSimilarity = best ? this.calculateNameSimilarity(baseName, this.extractBaseName(best.name)) : 0;
+          return currentSimilarity > bestSimilarity ? current : best;
+        });
+
+        const bestBaseSimilarity = this.calculateNameSimilarity(baseName, this.extractBaseName(bestBaseMatch.name));
+        if (bestBaseSimilarity > 0.8) {
+          logger.info('Found client by base name similarity:', { 
+            clientId: bestBaseMatch.id, 
+            originalName: bestBaseMatch.name,
+            newName: name,
+            baseName: baseName,
+            similarity: bestBaseSimilarity
+          });
+          return bestBaseMatch;
+        }
+      }
+    }
+
+    logger.info('No existing client found for:', { notionPageId, name, contactEmail });
+    return null;
+  }
+
+  /**
+   * Sync a single client from Notion - AGGRESSIVE duplicate prevention
    */
   async syncClient(notionPageId: string): Promise<{
     success: boolean;
@@ -258,6 +492,7 @@ export class ClientSyncService {
   }> {
     try {
       logger.info('Starting client sync:', { notionPageId });
+      
       // Get the page from Notion
       const page = await notion.pages.retrieve({ page_id: notionPageId });
       
@@ -273,19 +508,21 @@ export class ClientSyncService {
       const contactEmail = this.extractContactEmail(page.properties);
       const productsServices = this.extractProductsServices(page.properties);
       const clientPageInfo = await this.extractPageContent(notionPageId);
-      const slug = this.generateSlug(name);
 
-      // Check if client already exists
-      const existingClient = await this.getExistingClient(notionPageId);
+      // COMPREHENSIVE search for ANY existing client that matches
+      const existingClient = await this.findAnyMatchingClient(notionPageId, name, contactEmail);
+      
+      // NEVER change the slug if client exists - slug is immutable!
+      const slug = existingClient ? existingClient.slug : this.generateSlug(name);
       
       const clientData = {
         name,
-        slug,
+        slug, // This will NEVER change for existing clients
         contact_email: contactEmail,
         products_services: productsServices,
         client_page_info: clientPageInfo,
         settings: {
-          notion_page_id: notionPageId,
+          notion_page_id: notionPageId, // Store in JSON settings (the only place it can be stored)
           notion_properties: page.properties,
           last_synced_at: new Date().toISOString(),
           last_edited_time: page.last_edited_time,
@@ -293,9 +530,17 @@ export class ClientSyncService {
         updated_at: new Date().toISOString(),
       };
 
-      let result;
       if (existingClient) {
-        // Update existing client
+        // ALWAYS update existing client - never create new
+        logger.info('Updating existing client:', { 
+          clientId: existingClient.id, 
+          originalName: existingClient.name,
+          newName: name,
+          originalSlug: existingClient.slug,
+          keptSlug: slug,
+          notionPageId
+        });
+
         const { data, error } = await supabase
           .from('clients')
           .update(clientData)
@@ -304,71 +549,32 @@ export class ClientSyncService {
           .single();
 
         if (error) {
-          logger.error('Error updating client:', { error, clientId: existingClient.id });
+          logger.error('Error updating existing client:', { error, clientId: existingClient.id });
           return { success: false, action: 'skipped', error: error.message };
         }
 
-        result = { success: true, action: 'updated' as const, client: data };
-        logger.info('Client updated:', { name, notionPageId, clientId: existingClient.id });
+        return { success: true, action: 'updated' as const, client: data };
       } else {
-        // Check if client with same slug already exists (fallback check)
-        const { data: existingBySlug, error: slugError } = await supabase
+        // Only create if absolutely no match found
+        logger.info('Creating new client (no matches found):', { name, slug, notionPageId });
+
+        const { data, error } = await supabase
           .from('clients')
-          .select('*')
-          .eq('slug', slug)
+          .insert({
+            ...clientData,
+            id: uuidv4(),
+            created_at: new Date().toISOString(),
+          })
+          .select()
           .single();
 
-        if (slugError && slugError.code !== 'PGRST116') {
-          logger.error('Error checking for existing client by slug:', { error: slugError, slug });
-          return { success: false, action: 'skipped', error: slugError.message };
+        if (error) {
+          logger.error('Error creating new client:', { error, name, notionPageId });
+          return { success: false, action: 'skipped', error: error.message };
         }
 
-        if (existingBySlug) {
-          // Update existing client with Notion page ID
-          const { data, error } = await supabase
-            .from('clients')
-            .update({
-              ...clientData,
-              settings: {
-                ...clientData.settings,
-                notion_page_id: notionPageId,
-                last_synced_at: new Date().toISOString(),
-              }
-            })
-            .eq('id', existingBySlug.id)
-            .select()
-            .single();
-
-          if (error) {
-            logger.error('Error updating existing client by slug:', { error, clientId: existingBySlug.id });
-            return { success: false, action: 'skipped', error: error.message };
-          }
-
-          result = { success: true, action: 'updated' as const, client: data };
-          logger.info('Client updated (found by slug):', { name, notionPageId, clientId: existingBySlug.id });
-        } else {
-          // Create new client
-          const { data, error } = await supabase
-            .from('clients')
-            .insert({
-              ...clientData,
-              id: uuidv4(),
-              created_at: new Date().toISOString(),
-            })
-            .select()
-            .single();
-
-          if (error) {
-            logger.error('Error creating client:', { error, name, notionPageId });
-            return { success: false, action: 'skipped', error: error.message };
-          }
-
-          result = { success: true, action: 'created' as const, client: data };
-          logger.info('Client created:', { name, notionPageId, clientId: data.id });
-        }
+        return { success: true, action: 'created' as const, client: data };
       }
-
-      return result;
     } catch (error) {
       logger.error('Error syncing client:', { error, notionPageId });
       return { success: false, action: 'skipped', error: error instanceof Error ? error.message : 'Unknown error' };

@@ -158,75 +158,178 @@ class ClientSyncService {
     }
     /**
      * Get existing client from Supabase by Notion page ID
+     * CRITICAL: Only uses JSON field since notion_page_id column doesn't exist in schema
      */
     async getExistingClient(notionPageId) {
         try {
-            // First try to find by exact Notion page ID match
-            let { data, error } = await supabase
+            logger_1.logger.info('Looking up client by notion_page_id:', { notionPageId });
+            // Search in JSON settings field (the ONLY place this data exists)
+            // Use ->> for text extraction instead of -> for JSON extraction
+            const { data, error } = await supabase
                 .from('clients')
                 .select('*')
-                .eq('settings->notion_page_id', notionPageId)
-                .single();
-            if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
-                logger_1.logger.error('Error fetching existing client by notion_page_id:', { error, notionPageId });
-                return null;
-            }
-            if (data) {
-                logger_1.logger.info('Found existing client by notion_page_id:', { clientId: data.id, notionPageId });
-                return data;
-            }
-            // If not found, try to find by slug (fallback for existing clients)
-            // This handles the case where clients were uploaded before webhook setup
-            logger_1.logger.info('Client not found by notion_page_id, trying to find by slug...', { notionPageId });
-            // Get the page from Notion to extract the name
-            const page = await notion.pages.retrieve({ page_id: notionPageId });
-            if (page.object === 'page' && 'properties' in page) {
-                const name = this.extractClientName(page.properties);
-                if (name && name !== 'Unknown Client') {
-                    const slug = this.generateSlug(name);
-                    // Try to find by slug
-                    const { data: slugData, error: slugError } = await supabase
-                        .from('clients')
-                        .select('*')
-                        .eq('slug', slug)
-                        .single();
-                    if (slugError && slugError.code !== 'PGRST116') {
-                        logger_1.logger.error('Error fetching existing client by slug:', { error: slugError, slug });
-                        return null;
-                    }
-                    if (slugData) {
-                        logger_1.logger.info('Found existing client by slug, updating notion_page_id:', {
-                            clientId: slugData.id,
-                            slug,
-                            notionPageId
-                        });
-                        // Update the client with the Notion page ID for future lookups
-                        await supabase
-                            .from('clients')
-                            .update({
-                            settings: {
-                                ...slugData.settings,
-                                notion_page_id: notionPageId,
-                                last_synced_at: new Date().toISOString(),
-                            }
-                        })
-                            .eq('id', slugData.id);
-                        return slugData;
-                    }
+                .eq('settings->>notion_page_id', notionPageId)
+                .order('created_at', { ascending: true }); // Get oldest first
+            if (!error && data && data.length > 0) {
+                // If multiple clients have the same notion_page_id (duplicates), use the oldest one
+                const primaryClient = data[0];
+                if (data.length > 1) {
+                    logger_1.logger.warn('Multiple clients found with same notion_page_id - using oldest:', {
+                        notionPageId,
+                        totalFound: data.length,
+                        primaryClientId: primaryClient.id,
+                        primaryClientName: primaryClient.name,
+                        duplicateIds: data.slice(1).map(c => ({ id: c.id, name: c.name }))
+                    });
                 }
+                else {
+                    logger_1.logger.info('Found existing client by JSON notion_page_id:', {
+                        clientId: primaryClient.id,
+                        notionPageId
+                    });
+                }
+                return primaryClient;
             }
+            logger_1.logger.info('No existing client found for notion_page_id:', { notionPageId });
             return null;
         }
         catch (error) {
-            logger_1.logger.error('Error in getExistingClient:', { error, notionPageId });
+            logger_1.logger.error('Error fetching existing client:', { error, notionPageId });
             return null;
         }
     }
     /**
-     * Sync a single client from Notion
+     * Calculate similarity between two names (0-1 scale)
+     */
+    calculateNameSimilarity(name1, name2) {
+        const normalize = (str) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const n1 = normalize(name1);
+        const n2 = normalize(name2);
+        if (n1 === n2)
+            return 1;
+        if (n1.includes(n2) || n2.includes(n1))
+            return 0.9;
+        // Simple Levenshtein-like similarity
+        const longer = n1.length > n2.length ? n1 : n2;
+        const shorter = n1.length > n2.length ? n2 : n1;
+        if (longer.length === 0)
+            return 1;
+        const distance = this.levenshteinDistance(longer, shorter);
+        return (longer.length - distance) / longer.length;
+    }
+    /**
+     * Calculate Levenshtein distance between two strings
+     */
+    levenshteinDistance(str1, str2) {
+        const matrix = [];
+        for (let i = 0; i <= str2.length; i++) {
+            matrix[i] = [i];
+        }
+        for (let j = 0; j <= str1.length; j++) {
+            matrix[0][j] = j;
+        }
+        for (let i = 1; i <= str2.length; i++) {
+            for (let j = 1; j <= str1.length; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                }
+                else {
+                    matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
+                }
+            }
+        }
+        return matrix[str2.length][str1.length];
+    }
+    /**
+     * Find ANY existing client that matches this Notion data - comprehensive search
+     */
+    async findAnyMatchingClient(notionPageId, name, contactEmail) {
+        logger_1.logger.info('Comprehensive client search:', { notionPageId, name, contactEmail });
+        // 1. Primary: Check by notion_page_id
+        let existingClient = await this.getExistingClient(notionPageId);
+        if (existingClient) {
+            logger_1.logger.info('Found client by notion_page_id:', { clientId: existingClient.id, name: existingClient.name });
+            return existingClient;
+        }
+        // 2. Secondary: Check by exact name match
+        const { data: exactNameMatch, error: nameError } = await supabase
+            .from('clients')
+            .select('*')
+            .eq('name', name)
+            .single();
+        if (!nameError && exactNameMatch) {
+            logger_1.logger.info('Found client by exact name match:', { clientId: exactNameMatch.id, name: exactNameMatch.name });
+            return exactNameMatch;
+        }
+        // 3. Tertiary: Check by contact email if available
+        if (contactEmail) {
+            const { data: emailMatch, error: emailError } = await supabase
+                .from('clients')
+                .select('*')
+                .eq('contact_email', contactEmail)
+                .single();
+            if (!emailError && emailMatch) {
+                logger_1.logger.info('Found client by contact email:', { clientId: emailMatch.id, email: contactEmail });
+                return emailMatch;
+            }
+        }
+        // 4. Quaternary: Fuzzy name matching for similar names
+        if (name.length > 3) {
+            const nameWords = name.toLowerCase().split(' ').filter(word => word.length > 2);
+            if (nameWords.length > 0) {
+                const { data: similarClients, error: similarError } = await supabase
+                    .from('clients')
+                    .select('*')
+                    .or(nameWords.map(word => `name.ilike.%${word}%`).join(','));
+                if (!similarError && similarClients && similarClients.length > 0) {
+                    // Find the best match by comparing name similarity
+                    const bestMatch = similarClients.reduce((best, current) => {
+                        const currentSimilarity = this.calculateNameSimilarity(name, current.name);
+                        const bestSimilarity = best ? this.calculateNameSimilarity(name, best.name) : 0;
+                        return currentSimilarity > bestSimilarity ? current : best;
+                    });
+                    // High similarity threshold to prevent false matches
+                    if (this.calculateNameSimilarity(name, bestMatch.name) > 0.8) {
+                        logger_1.logger.info('Found client by fuzzy name match:', {
+                            clientId: bestMatch.id,
+                            originalName: bestMatch.name,
+                            newName: name,
+                            similarity: this.calculateNameSimilarity(name, bestMatch.name)
+                        });
+                        return bestMatch;
+                    }
+                }
+            }
+        }
+        // 5. Last resort: Check for clients with same slug pattern
+        const potentialSlug = this.generateSlug(name);
+        const { data: slugMatches, error: slugError } = await supabase
+            .from('clients')
+            .select('*')
+            .like('slug', `${potentialSlug}%`);
+        if (!slugError && slugMatches && slugMatches.length > 0) {
+            // Look for exact slug match or base slug (without numbers)
+            const exactSlugMatch = slugMatches.find(client => client.slug === potentialSlug);
+            if (exactSlugMatch) {
+                logger_1.logger.info('Found client by exact slug match:', { clientId: exactSlugMatch.id, slug: exactSlugMatch.slug });
+                return exactSlugMatch;
+            }
+            // Look for base slug match (original without numbers)
+            const baseSlugMatch = slugMatches.find(client => client.slug === potentialSlug && !client.slug.match(/-\d+$/));
+            if (baseSlugMatch) {
+                logger_1.logger.info('Found client by base slug match:', { clientId: baseSlugMatch.id, slug: baseSlugMatch.slug });
+                return baseSlugMatch;
+            }
+        }
+        logger_1.logger.info('No existing client found for:', { notionPageId, name, contactEmail });
+        return null;
+    }
+    /**
+     * Sync a single client from Notion - AGGRESSIVE duplicate prevention
      */
     async syncClient(notionPageId) {
         try {
+            logger_1.logger.info('Starting client sync:', { notionPageId });
             // Get the page from Notion
             const page = await notion.pages.retrieve({ page_id: notionPageId });
             if (page.object !== 'page' || !('properties' in page)) {
@@ -239,26 +342,34 @@ class ClientSyncService {
             const contactEmail = this.extractContactEmail(page.properties);
             const productsServices = this.extractProductsServices(page.properties);
             const clientPageInfo = await this.extractPageContent(notionPageId);
-            const slug = this.generateSlug(name);
-            // Check if client already exists
-            const existingClient = await this.getExistingClient(notionPageId);
+            // COMPREHENSIVE search for ANY existing client that matches
+            const existingClient = await this.findAnyMatchingClient(notionPageId, name, contactEmail);
+            // NEVER change the slug if client exists - slug is immutable!
+            const slug = existingClient ? existingClient.slug : this.generateSlug(name);
             const clientData = {
                 name,
-                slug,
+                slug, // This will NEVER change for existing clients
                 contact_email: contactEmail,
                 products_services: productsServices,
                 client_page_info: clientPageInfo,
                 settings: {
-                    notion_page_id: notionPageId,
+                    notion_page_id: notionPageId, // Store in JSON settings (the only place it can be stored)
                     notion_properties: page.properties,
                     last_synced_at: new Date().toISOString(),
                     last_edited_time: page.last_edited_time,
                 },
                 updated_at: new Date().toISOString(),
             };
-            let result;
             if (existingClient) {
-                // Update existing client
+                // ALWAYS update existing client - never create new
+                logger_1.logger.info('Updating existing client:', {
+                    clientId: existingClient.id,
+                    originalName: existingClient.name,
+                    newName: name,
+                    originalSlug: existingClient.slug,
+                    keptSlug: slug,
+                    notionPageId
+                });
                 const { data, error } = await supabase
                     .from('clients')
                     .update(clientData)
@@ -266,65 +377,29 @@ class ClientSyncService {
                     .select()
                     .single();
                 if (error) {
-                    logger_1.logger.error('Error updating client:', { error, clientId: existingClient.id });
+                    logger_1.logger.error('Error updating existing client:', { error, clientId: existingClient.id });
                     return { success: false, action: 'skipped', error: error.message };
                 }
-                result = { success: true, action: 'updated', client: data };
-                logger_1.logger.info('Client updated:', { name, notionPageId, clientId: existingClient.id });
+                return { success: true, action: 'updated', client: data };
             }
             else {
-                // Check if client with same slug already exists (fallback check)
-                const { data: existingBySlug, error: slugError } = await supabase
+                // Only create if absolutely no match found
+                logger_1.logger.info('Creating new client (no matches found):', { name, slug, notionPageId });
+                const { data, error } = await supabase
                     .from('clients')
-                    .select('*')
-                    .eq('slug', slug)
+                    .insert({
+                    ...clientData,
+                    id: (0, uuid_1.v4)(),
+                    created_at: new Date().toISOString(),
+                })
+                    .select()
                     .single();
-                if (slugError && slugError.code !== 'PGRST116') {
-                    logger_1.logger.error('Error checking for existing client by slug:', { error: slugError, slug });
-                    return { success: false, action: 'skipped', error: slugError.message };
+                if (error) {
+                    logger_1.logger.error('Error creating new client:', { error, name, notionPageId });
+                    return { success: false, action: 'skipped', error: error.message };
                 }
-                if (existingBySlug) {
-                    // Update existing client with Notion page ID
-                    const { data, error } = await supabase
-                        .from('clients')
-                        .update({
-                        ...clientData,
-                        settings: {
-                            ...clientData.settings,
-                            notion_page_id: notionPageId,
-                            last_synced_at: new Date().toISOString(),
-                        }
-                    })
-                        .eq('id', existingBySlug.id)
-                        .select()
-                        .single();
-                    if (error) {
-                        logger_1.logger.error('Error updating existing client by slug:', { error, clientId: existingBySlug.id });
-                        return { success: false, action: 'skipped', error: error.message };
-                    }
-                    result = { success: true, action: 'updated', client: data };
-                    logger_1.logger.info('Client updated (found by slug):', { name, notionPageId, clientId: existingBySlug.id });
-                }
-                else {
-                    // Create new client
-                    const { data, error } = await supabase
-                        .from('clients')
-                        .insert({
-                        ...clientData,
-                        id: (0, uuid_1.v4)(),
-                        created_at: new Date().toISOString(),
-                    })
-                        .select()
-                        .single();
-                    if (error) {
-                        logger_1.logger.error('Error creating client:', { error, name, notionPageId });
-                        return { success: false, action: 'skipped', error: error.message };
-                    }
-                    result = { success: true, action: 'created', client: data };
-                    logger_1.logger.info('Client created:', { name, notionPageId, clientId: data.id });
-                }
+                return { success: true, action: 'created', client: data };
             }
-            return result;
         }
         catch (error) {
             logger_1.logger.error('Error syncing client:', { error, notionPageId });
@@ -578,6 +653,11 @@ class ClientSyncService {
             const { type, entity, page, data } = webhookData;
             let pageId;
             let databaseId;
+            // Handle ping webhooks (Notion's health check)
+            if (type === 'ping') {
+                logger_1.logger.info('Received ping webhook from Notion');
+                return { success: true, message: 'Ping received and acknowledged' };
+            }
             // Extract page ID and database ID based on webhook type
             if (type === 'page.deleted') {
                 pageId = entity?.id;
@@ -587,12 +667,50 @@ class ClientSyncService {
                 pageId = page?.id;
                 databaseId = page?.parent?.database_id;
             }
+            else if (type === 'page.properties_updated') {
+                pageId = entity?.id;
+                databaseId = data?.parent?.id;
+            }
             else if (type === 'page.content_updated') {
                 pageId = entity?.id;
                 databaseId = data?.parent?.id;
             }
+            // Enhanced debugging for property updates specifically
+            if (type === 'page.properties_updated') {
+                logger_1.logger.info('Property update webhook received:', {
+                    type,
+                    pageId,
+                    databaseId,
+                    hasUpdatedProperties: !!(data?.updated_properties),
+                    updatedPropertiesCount: data?.updated_properties?.length || 0,
+                    updatedProperties: data?.updated_properties,
+                    entityId: entity?.id,
+                    parentType: data?.parent?.type,
+                    parentId: data?.parent?.id
+                });
+            }
+            // Log successful page ID extraction for all webhook types
+            logger_1.logger.info('Webhook page ID extracted successfully:', {
+                type,
+                pageId,
+                databaseId,
+                extractionMethod: type === 'page.properties_updated' || type === 'page.content_updated' || type === 'page.deleted' ? 'entity.id' : 'page.id'
+            });
             if (!pageId) {
-                return { success: false, message: 'Invalid webhook: no page ID found' };
+                logger_1.logger.error('Webhook page ID extraction failed:', {
+                    type,
+                    hasEntity: !!entity,
+                    hasPage: !!page,
+                    hasData: !!data,
+                    entityId: entity?.id,
+                    pageId: page?.id,
+                    webhookStructure: {
+                        entityType: entity?.type,
+                        dataKeys: data ? Object.keys(data) : [],
+                        parentType: data?.parent?.type
+                    }
+                });
+                return { success: false, message: `Invalid webhook: no page ID found for type ${type}` };
             }
             // Validate that this webhook is from the clients database
             if (databaseId && databaseId !== this.databaseId) {
@@ -626,6 +744,7 @@ class ClientSyncService {
             switch (type) {
                 case 'page.updated':
                 case 'page.content_updated':
+                case 'page.properties_updated':
                     const result = await this.syncClient(pageId);
                     if (result.success) {
                         const action = result.action === 'created' ? 'created' : 'updated';

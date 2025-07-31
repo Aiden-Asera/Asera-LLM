@@ -45,7 +45,18 @@ function verifyNotionWebhook(request, body) {
  */
 router.post('/notion', async (req, res) => {
     try {
+        logger_1.logger.info('Webhook received:', {
+            headers: req.headers,
+            bodyKeys: Object.keys(req.body),
+            hasVerificationToken: !!req.body.verification_token,
+            type: req.body.type
+        });
         const body = JSON.stringify(req.body);
+        // Handle Notion's verification requests first
+        if (req.body.verification_token) {
+            logger_1.logger.info('Handling Notion verification request');
+            return res.status(200).json({ challenge: req.body.verification_token });
+        }
         // For private integrations, skip signature verification
         // Private integrations don't provide webhook secrets
         if (process.env.NOTION_WEBHOOK_SECRET) {
@@ -54,14 +65,10 @@ router.post('/notion', async (req, res) => {
                 return res.status(401).json({ error: 'Invalid signature' });
             }
         }
-        else {
-            logger_1.logger.info('Private integration detected, skipping signature verification');
+        // Only log meaningful webhooks
+        if (req.body.type && req.body.type !== 'ping') {
+            logger_1.logger.info('Processing Notion webhook:', { type: req.body.type });
         }
-        logger_1.logger.info('Received Notion webhook:', {
-            type: req.body.type,
-            pageId: req.body.page?.id,
-            timestamp: new Date().toISOString(),
-        });
         // Process the webhook
         const result = await clientSync_1.clientSyncService.handleWebhook(req.body);
         if (result.success) {
@@ -82,7 +89,11 @@ router.post('/notion', async (req, res) => {
         }
     }
     catch (error) {
-        logger_1.logger.error('Error processing webhook:', { error });
+        logger_1.logger.error('Error processing webhook:', {
+            error,
+            stack: error instanceof Error ? error.stack : undefined,
+            body: req.body
+        });
         res.status(500).json({
             success: false,
             error: 'Internal server error',
